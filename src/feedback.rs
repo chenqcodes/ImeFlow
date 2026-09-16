@@ -37,9 +37,6 @@ pub struct Stats {
     /// Confirmed automatic requests, not a guarantee of saved keystrokes.
     pub today_auto_switch: u64,
     pub total_auto_switch: u64,
-    /// Applied switch followed by typing without a corrective Shift first.
-    pub today_effective: u64,
-    pub total_effective: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,8 +44,6 @@ struct PersistentStats {
     day: String,
     today_auto_switch: u64,
     total_auto_switch: u64,
-    today_effective: u64,
-    total_effective: u64,
 }
 
 struct Inner {
@@ -176,24 +171,6 @@ impl FeedbackBus {
         (g.current.process.clone(), visible_stats(&g.persisted, &local_day()))
     }
 
-    /// User typed after an auto-switch without first correcting with Shift.
-    pub fn record_effective(&self) {
-        let mut g = self.inner.lock();
-        let _ = rollover(&mut g.persisted, &local_day());
-        g.persisted.today_effective = g.persisted.today_effective.saturating_add(1);
-        g.persisted.total_effective = g.persisted.total_effective.saturating_add(1);
-        tracing::info!(
-            today = g.persisted.today_effective,
-            total = g.persisted.total_effective,
-            "stats: effective switch (+1)"
-        );
-        if g.persistence_enabled {
-            if let Err(error) = persist_to(&g.persist_path, &g.persisted) {
-                tracing::warn!(%error, "stats: persistence failed; in-memory counters retained");
-            }
-        }
-    }
-
     /// Best-known 中/英 for the tray glyph. Includes Assumed/Requested so the icon
     /// is not stuck on gray until IMM happens to return Confident.
     pub fn tray_mode(&self) -> Option<TargetMode> {
@@ -221,15 +198,12 @@ fn visible_stats(stats: &PersistentStats, day: &str) -> Stats {
     Stats {
         today_auto_switch: if stats.day == day { stats.today_auto_switch } else { 0 },
         total_auto_switch: stats.total_auto_switch,
-        today_effective: if stats.day == day { stats.today_effective } else { 0 },
-        total_effective: stats.total_effective,
     }
 }
 fn rollover(stats: &mut PersistentStats, day: &str) -> bool {
     if stats.day == day { return false; }
     stats.day = day.into();
     stats.today_auto_switch = 0;
-    stats.today_effective = 0;
     true
 }
 fn stats_path() -> PathBuf {
@@ -310,35 +284,16 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
     #[test]
-    fn effective_counter_persists_and_rolls_today() {
-        let path = temporary();
-        let bus = FeedbackBus::from_path(path.clone());
-        bus.record_effective();
-        bus.record_effective();
-        let (_, stats) = bus.tip_stats();
-        assert_eq!(stats.today_effective, 2);
-        assert_eq!(stats.total_effective, 2);
-        assert_eq!(stats.today_auto_switch, 0);
-        let again = FeedbackBus::from_path(path.clone());
-        assert_eq!(again.tip_stats().1.total_effective, 2);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn rollover_and_counter_limits_are_explicit() {
         let mut stats = PersistentStats {
             day: "yesterday".into(),
             today_auto_switch: 7,
             total_auto_switch: 50,
-            today_effective: 3,
-            total_effective: 20,
         };
         assert_eq!(visible_stats(&stats, "today").today_auto_switch, 0);
-        assert_eq!(visible_stats(&stats, "today").today_effective, 0);
         assert!(rollover(&mut stats, "today"));
         assert_eq!(stats.total_auto_switch, 50);
-        assert_eq!(stats.total_effective, 20);
-        assert_eq!(stats.today_effective, 0);
+        assert_eq!(stats.today_auto_switch, 0);
         assert!(!rollover(&mut stats, "today"));
         let path = temporary(); let bus = FeedbackBus::from_path(path.clone());
         bus.inner.lock().persisted.total_auto_switch = u64::MAX;

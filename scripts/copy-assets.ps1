@@ -4,10 +4,10 @@ $root = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $root 'assets'
 $destination = Join-Path $Bin 'assets'
 $required = @(
-    'icons/imeflow_tray_zh.png',
-    'icons/imeflow_tray_en.png',
-    'icons/imeflow_tray_off.png',
-    'icons/imeflow_tray_neutral.png'
+    'icons/imeflow.png',
+    'icons/imeflow_zh.png',
+    'icons/imeflow_en.png',
+    'icons/imeflow_off.png'
 )
 foreach ($relative in $required) {
     $file = Join-Path $source $relative
@@ -24,5 +24,11 @@ foreach ($relative in $required) {
 $staleToast = Join-Path $destination 'ui'
 if (Test-Path -LiteralPath $staleToast -PathType Container) {
     Remove-Item -LiteralPath $staleToast -Recurse -Force
+}
+$staleIcons = Join-Path $destination 'icons'
+if (Test-Path -LiteralPath $staleIcons -PathType Container) {
+    Get-ChildItem -LiteralPath $staleIcons -Filter 'imeflow_tray_*.png' | ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Force
+    }
 }
 Write-Host "Assets copied: $destination"

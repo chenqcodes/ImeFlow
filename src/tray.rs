@@ -1,4 +1,4 @@
-//! System tray. Icons are loaded from assets/icons/*.png; shell calls are queued and deduplicated.
+//! System tray. Four connected 中E states from assets/icons/; shell calls are queued and deduplicated.
 use crate::{debug_ui, feedback::FeedbackBus, mode::TargetMode, ui_graphics::OwnedIcon};
 use once_cell::sync::OnceCell;
 use std::ffi::OsStr;
@@ -68,7 +68,7 @@ pub fn install(bus: FeedbackBus, initially_enabled: bool) -> Result<HWND, String
     TRAY_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
     TASKBAR_CREATED.store(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }, Ordering::SeqCst);
     if let Err(e) = publish(hwnd, true) { remove(); return Err(e); }
-    tracing::info!("tray: four PNG states installed; neutral and paused use different assets");
+    tracing::info!("tray: four 中E states installed");
     Ok(hwnd)
 }
 
@@ -78,7 +78,6 @@ fn load_icons() -> Result<(), String> {
     let width = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 64).max(32) as usize;
     let height = unsafe { GetSystemMetrics(SM_CYSMICON) }.clamp(16, 64).max(32) as usize;
     let mut icons = Vec::with_capacity(4);
-    // Ligature assets are already square and edge-filled; contain-fit keeps proportions.
     for image in &assets.icons {
         icons.push(OwnedIcon::from_image(&image.fitted(width, height)?)?);
     }
@@ -87,7 +86,7 @@ fn load_icons() -> Result<(), String> {
         if old != 0 { unsafe { let _ = DestroyIcon(HICON(old as *mut _)); } }
     }
     if let Some(last) = LAST_SENT.get() { *last.lock() = None; }
-    tracing::info!(width, height, "tray: 中E ligature icons loaded");
+    tracing::info!(width, height, "tray: 中E icons loaded");
     Ok(())
 }
 fn release_icons() {
@@ -122,7 +121,6 @@ fn icon_index(on: bool, mode: Option<TargetMode>) -> usize {
     match mode {
         Some(TargetMode::NativeChinese) => 0,
         Some(TargetMode::ImeEnglish | TargetMode::LayoutEnglish) => 1,
-        // None = idle / unknown → full-color ligature (both sides lit).
         _ => 3,
     }
 }
@@ -152,11 +150,9 @@ fn presentation() -> (HICON, String) {
     let focus = if process.is_empty() { "—" } else { process.as_str() };
     // Multiline tip (Win10+). Keep under szTip 128 UTF-16 units.
     let tip = format!(
-        "ImeFlow · {state}\n{mode_label} · {focus}\n今日  确认 {today} · 有效 {te}\n累计  确认 {total} · 有效 {tote}",
+        "ImeFlow · {state}\n{mode_label} · {focus}\n今日确认 {today}\n累计确认 {total}",
         today = stats.today_auto_switch,
-        te = stats.today_effective,
         total = stats.total_auto_switch,
-        tote = stats.total_effective,
     );
     (icon, tip)
 }
@@ -259,14 +255,8 @@ unsafe fn show_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else { return; };
     if let Some(bus) = BUS.get() {
         let (_, stats) = bus.tip_stats();
-        append_disabled(menu, &format!(
-            "今日  确认 {} · 有效 {}",
-            stats.today_auto_switch, stats.today_effective
-        ));
-        append_disabled(menu, &format!(
-            "累计  确认 {} · 有效 {}",
-            stats.total_auto_switch, stats.total_effective
-        ));
+        append_disabled(menu, &format!("今日确认 {}", stats.today_auto_switch));
+        append_disabled(menu, &format!("累计确认 {}", stats.total_auto_switch));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     }
     let checked = |value| if value { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED };
@@ -321,7 +311,7 @@ mod tests {
     }
     #[test]
     fn tip_uses_multiline_layout() {
-        let tip = "ImeFlow · 自动开启\n中 · Cursor.exe/edit\n今日  确认 1 · 有效 0\n累计  确认 2 · 有效 1";
+        let tip = "ImeFlow · 自动开启\n中 · Cursor.exe/edit\n今日确认 1\n累计确认 2";
         assert_eq!(tip.lines().count(), 4);
         assert!(tip.contains('\n'));
     }

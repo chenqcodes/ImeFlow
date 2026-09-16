@@ -1,8 +1,9 @@
 //! Phase-1 diagnostics: observe Shift after terminal toggles. No second toggle.
+//! LL hook is lazy: arm for terminal manual-override, then auto-unhook when idle.
 
 use parking_lot::Mutex;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -15,17 +16,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-use crate::feedback::FeedbackBus;
 use crate::ime::IMEF_EXTRA;
-use once_cell::sync::OnceCell;
 
 static STARTED: AtomicBool = AtomicBool::new(false);
+static PINNED: AtomicBool = AtomicBool::new(false);
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
-static FEEDBACK: OnceCell<FeedbackBus> = OnceCell::new();
-
-pub fn bind_feedback(bus: FeedbackBus) {
-    let _ = FEEDBACK.set(bus);
-}
+/// Bumps invalidate delayed idle-release timers when we re-arm or clear early.
+static RELEASE_GEN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ShiftPulse {
@@ -123,9 +120,6 @@ struct Shared {
     /// Track physical non-Shift keys while the lazy override hook is active.
     /// This lets us reject Shift+A / Shift+| / Ctrl+Shift as IME toggles.
     non_shift_down: HashSet<u32>,
-    /// After auto-switch: wait for typing without a prior corrective Shift.
-    effective_until: Option<Instant>,
-    effective_shift_down: bool,
 }
 
 static SHARED: once_cell::sync::Lazy<Arc<Mutex<Shared>>> =
@@ -139,6 +133,11 @@ pub fn classify_shift_source(extra: usize, flags: u32) -> &'static str {
     } else {
         "physical"
     }
+}
+
+/// Keep the LL hook for the whole process (`--trace-keys`).
+pub fn pin_for_session() {
+    PINNED.store(true, Ordering::SeqCst);
 }
 
 /// Install WH_KEYBOARD_LL on a dedicated thread (must pump messages).
@@ -200,6 +199,7 @@ fn run_hook_loop(hook: HHOOK) {
     }
     HOOK_THREAD.store(0, Ordering::SeqCst);
     STARTED.store(false, Ordering::SeqCst);
+    tracing::info!("key_trace: WH_KEYBOARD_LL released");
 }
 
 pub fn stop() {
@@ -209,6 +209,56 @@ pub fn stop() {
             let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+fn hook_needed(shared: &Shared) -> bool {
+    if shared.arm.is_some() {
+        return true;
+    }
+    match shared.override_until {
+        Some(until) if Instant::now() <= until => true,
+        _ => false,
+    }
+}
+
+fn expire_override(shared: &mut Shared) {
+    if let Some(until) = shared.override_until {
+        if Instant::now() > until {
+            shared.override_until = None;
+            shared.shift_tap = None;
+            shared.non_shift_down.clear();
+        }
+    }
+}
+
+/// Drop the LL hook when nothing is listening. Safe to call from the hook callback
+/// (only posts WM_QUIT; Unhook runs after the callback returns).
+fn release_if_idle() {
+    if PINNED.load(Ordering::SeqCst) {
+        return;
+    }
+    let needed = {
+        let mut shared = SHARED.lock();
+        expire_override(&mut shared);
+        hook_needed(&shared)
+    };
+    if !needed {
+        stop();
+    }
+}
+
+fn schedule_release_after(delay: Duration) {
+    let gen = RELEASE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::Builder::new()
+        .name("imeflow-hook-idle".into())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            if RELEASE_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            release_if_idle();
+        })
+        .ok();
 }
 
 /// Begin collecting VK_SHIFT for `window` after the next terminal Shift pulse.
@@ -242,6 +292,8 @@ pub fn finish_shift_window() -> Option<ShiftWatchReport> {
 
     let mut shared = SHARED.lock();
     let arm = shared.arm.take()?;
+    drop(shared);
+    release_if_idle();
     Some(ShiftWatchReport {
         apply_id,
         window_ms: window.as_millis() as u64,
@@ -251,20 +303,25 @@ pub fn finish_shift_window() -> Option<ShiftWatchReport> {
 
 pub fn cancel_shift_window() {
     SHARED.lock().arm = None;
+    release_if_idle();
 }
 
 /// terminal→英 之后武装：用户非 ImeFlow 的 Shift → take_user_chinese_override。
-/// 懒启动 LL hook（不必开 --trace-keys）；窗口默认几分钟，够「临时中文再切走」。
+/// 懒启动 LL hook（不必开 --trace-keys）；窗口结束后自动卸钩。
 pub fn arm_user_override(window: Duration) {
     if let Err(e) = start() {
         tracing::warn!(%e, "user-override arm skipped (hook start failed)");
         return;
     }
-    let mut shared = SHARED.lock();
-    shared.override_until = Some(Instant::now() + window);
-    shared.user_chinese = false;
-    shared.shift_tap = None;
-    shared.non_shift_down.clear();
+    {
+        let mut shared = SHARED.lock();
+        shared.override_until = Some(Instant::now() + window);
+        shared.user_chinese = false;
+        shared.shift_tap = None;
+        shared.non_shift_down.clear();
+    }
+    // +200ms slack so the last key in the window is still observed.
+    schedule_release_after(window + Duration::from_millis(200));
     tracing::info!(
         window_ms = window.as_millis() as u64,
         "key_trace: user-override armed (clean physical Shift tap → memory 中)"
@@ -272,45 +329,35 @@ pub fn arm_user_override(window: Duration) {
 }
 
 pub fn clear_user_override() {
-    let mut shared = SHARED.lock();
-    shared.override_until = None;
-    shared.user_chinese = false;
-    shared.shift_tap = None;
-    shared.non_shift_down.clear();
-}
-
-/// After a real auto-switch: first typing without a lone corrective Shift counts as effective.
-pub fn arm_effective_check(window: Duration) {
-    if let Err(e) = start() {
-        tracing::warn!(%e, "effective-check arm skipped (hook start failed)");
-        return;
+    RELEASE_GEN.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut shared = SHARED.lock();
+        shared.override_until = None;
+        shared.user_chinese = false;
+        shared.shift_tap = None;
+        shared.non_shift_down.clear();
     }
-    let mut shared = SHARED.lock();
-    shared.effective_until = Some(Instant::now() + window);
-    shared.effective_shift_down = false;
-    tracing::debug!(
-        window_ms = window.as_millis() as u64,
-        "key_trace: effective-check armed"
-    );
+    release_if_idle();
 }
 
 /// Consume a completed clean physical Shift tap. The caller should invoke this before
 /// clearing per-root state, so “temporary Chinese then immediately switch app” is not lost.
 pub fn take_user_chinese_override() -> bool {
-    let mut shared = SHARED.lock();
-    if let Some(until) = shared.override_until {
-        if Instant::now() > until {
+    let hit = {
+        let mut shared = SHARED.lock();
+        expire_override(&mut shared);
+        let hit = shared.user_chinese;
+        if hit {
+            shared.user_chinese = false;
             shared.override_until = None;
             shared.shift_tap = None;
             shared.non_shift_down.clear();
         }
-    }
-    let hit = shared.user_chinese;
+        hit
+    };
     if hit {
-        shared.user_chinese = false;
-        shared.override_until = None;
-        shared.shift_tap = None;
-        shared.non_shift_down.clear();
+        RELEASE_GEN.fetch_add(1, Ordering::SeqCst);
+        release_if_idle();
     }
     hit
 }
@@ -349,58 +396,6 @@ unsafe extern "system" fn low_level_proc(code: i32, wparam: WPARAM, lparam: LPAR
 
 fn is_shift_vk(vk: u32) -> bool {
     matches!(vk, 0x10 | 0xA0 | 0xA1)
-}
-
-fn is_typeable_vk(vk: u32) -> bool {
-    matches!(vk,
-        0x20 | 0x0D | // space, enter
-        0x30..=0x39 | // 0-9
-        0x41..=0x5A | // A-Z
-        0xBA..=0xC0 | 0xDB..=0xDE // OEM punctuation
-    )
-}
-
-fn note_effective_key(shared: &mut Shared, vk: u32, up: bool, source: &'static str, now: Instant) {
-    let Some(until) = shared.effective_until else {
-        return;
-    };
-    if now > until {
-        shared.effective_until = None;
-        shared.effective_shift_down = false;
-        return;
-    }
-    // Ignore our own injected Shift pulse.
-    if source == "imeflow" {
-        return;
-    }
-
-    if is_shift_vk(vk) {
-        if source != "physical" {
-            return;
-        }
-        if !up {
-            shared.effective_shift_down = true;
-            return;
-        }
-        // Lone Shift release before typing → user corrected IME; do not count.
-        if shared.effective_shift_down {
-            shared.effective_until = None;
-            shared.effective_shift_down = false;
-            tracing::info!("effective: cancelled (corrective Shift before typing)");
-        }
-        return;
-    }
-
-    if up || !is_typeable_vk(vk) {
-        return;
-    }
-    // Shift+letter still counts: the auto-switch was used; Shift was for case, not IME.
-    shared.effective_until = None;
-    shared.effective_shift_down = false;
-    if let Some(bus) = FEEDBACK.get() {
-        bus.record_effective();
-        crate::tray::refresh();
-    }
 }
 
 fn note_override_key(shared: &mut Shared, vk: u32, up: bool, source: &'static str, now: Instant) {
@@ -473,50 +468,38 @@ fn note_key(kb: &KBDLLHOOKSTRUCT, up: bool) {
     let now = Instant::now();
     let vk = kb.vkCode;
 
-    let mut shared = SHARED.lock();
-    note_effective_key(&mut shared, vk, up, source, now);
-    note_override_key(&mut shared, vk, up, source, now);
+    let idle = {
+        let mut shared = SHARED.lock();
+        note_override_key(&mut shared, vk, up, source, now);
 
-    if !is_shift_vk(vk) {
-        return;
-    }
-    let Some(arm) = shared.arm.as_mut() else {
-        return;
+        if is_shift_vk(vk) {
+            if let Some(arm) = shared.arm.as_mut() {
+                let elapsed = arm.started.elapsed();
+                if elapsed <= arm.window {
+                    arm.pulses.push(ShiftPulse {
+                        ms_after_arm: elapsed.as_millis() as u64,
+                        up,
+                        vk: kb.vkCode as u16,
+                        scan: kb.scanCode as u16,
+                        flags,
+                        extra,
+                        source,
+                    });
+                }
+            }
+        }
+        expire_override(&mut shared);
+        !hook_needed(&shared)
     };
-    let elapsed = arm.started.elapsed();
-    if elapsed > arm.window {
-        return;
+    // Post quit only; Unhook runs after this callback returns.
+    if idle {
+        release_if_idle();
     }
-    arm.pulses.push(ShiftPulse {
-        ms_after_arm: elapsed.as_millis() as u64,
-        up,
-        vk: kb.vkCode as u16,
-        scan: kb.scanCode as u16,
-        flags,
-        extra,
-        source,
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn effective_shift_alone_cancels_typeable_counts() {
-        let mut s = Shared::default();
-        let t = Instant::now();
-        s.effective_until = Some(t + Duration::from_secs(30));
-        note_effective_key(&mut s, 0xA0, false, "physical", t);
-        note_effective_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(100));
-        assert!(s.effective_until.is_none());
-
-        s.effective_until = Some(t + Duration::from_secs(30));
-        s.effective_shift_down = false;
-        // No FeedbackBus bound in unit test; just ensure arm clears on typeable.
-        note_effective_key(&mut s, 0x41, false, "physical", t);
-        assert!(s.effective_until.is_none());
-    }
 
     #[test]
     fn classify_prefers_imeflow_tag() {
@@ -527,99 +510,105 @@ mod tests {
 
     #[test]
     fn report_detects_foreign_shift() {
-        let report = ShiftWatchReport {
+        let mut report = ShiftWatchReport {
             apply_id: 1,
             window_ms: 500,
-            pulses: vec![
-                ShiftPulse {
-                    ms_after_arm: 1,
-                    up: false,
-                    vk: 0xA0,
-                    scan: 0x2A,
-                    flags: LLKHF_INJECTED.0,
-                    extra: IMEF_EXTRA,
-                    source: "imeflow",
-                },
-                ShiftPulse {
-                    ms_after_arm: 80,
-                    up: false,
-                    vk: 0xA0,
-                    scan: 0x2A,
-                    flags: 0,
-                    extra: 0,
-                    source: "physical",
-                },
-            ],
+            pulses: vec![],
         };
+        assert!(!report.foreign_shift());
+        report.pulses.push(ShiftPulse {
+            ms_after_arm: 10,
+            up: false,
+            vk: 0xA0,
+            scan: 0x2A,
+            flags: 0,
+            extra: IMEF_EXTRA,
+            source: "imeflow",
+        });
+        assert!(!report.foreign_shift());
+        report.pulses.push(ShiftPulse {
+            ms_after_arm: 20,
+            up: false,
+            vk: 0xA0,
+            scan: 0x2A,
+            flags: 0,
+            extra: 0,
+            source: "physical",
+        });
         assert!(report.foreign_shift());
-        assert!(report.summarize().contains("physical:1"));
-    }
-
-    fn override_state(now: Instant) -> Shared {
-        let mut s = Shared::default();
-        s.override_until = Some(now + Duration::from_secs(5));
-        s
     }
 
     #[test]
-    fn clean_shift_tap_marks_manual_chinese() {
+    fn clean_shift_tap_toggles_override_parity() {
+        let mut s = Shared::default();
         let t = Instant::now();
-        let mut s = override_state(t);
+        s.override_until = Some(t + Duration::from_secs(5));
         note_override_key(&mut s, 0xA0, false, "physical", t);
         note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(120));
         assert!(s.user_chinese);
-    }
-
-    #[test]
-    fn two_clean_shift_taps_cancel_manual_chinese_override() {
-        let t = Instant::now();
-        let mut s = override_state(t);
-        note_override_key(&mut s, 0xA0, false, "physical", t);
-        note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(100));
-        note_override_key(&mut s, 0xA0, false, "physical", t + Duration::from_millis(180));
+        note_override_key(&mut s, 0xA0, false, "physical", t + Duration::from_millis(200));
         note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(280));
         assert!(!s.user_chinese);
     }
 
     #[test]
-    fn shift_letter_chord_is_not_manual_ime_toggle() {
+    fn shift_chord_is_ignored() {
+        let mut s = Shared::default();
         let t = Instant::now();
-        let mut s = override_state(t);
-        note_override_key(&mut s, 0xA0, false, "physical", t);
-        note_override_key(&mut s, 0x41, false, "physical", t + Duration::from_millis(30));
-        note_override_key(&mut s, 0x41, true, "physical", t + Duration::from_millis(60));
-        note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(90));
-        assert!(!s.user_chinese);
-    }
-
-    #[test]
-    fn ctrl_shift_is_not_manual_ime_toggle() {
-        let t = Instant::now();
-        let mut s = override_state(t);
-        note_override_key(&mut s, 0x11, false, "physical", t);
-        note_override_key(&mut s, 0xA0, false, "physical", t + Duration::from_millis(20));
+        s.override_until = Some(t + Duration::from_secs(5));
+        note_override_key(&mut s, 0x41, false, "physical", t);
+        note_override_key(&mut s, 0xA0, false, "physical", t + Duration::from_millis(30));
         note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(80));
-        note_override_key(&mut s, 0x11, true, "physical", t + Duration::from_millis(100));
         assert!(!s.user_chinese);
     }
 
     #[test]
-    fn injected_or_long_shift_does_not_mark_manual_chinese() {
+    fn ctrl_shift_is_ignored() {
+        let mut s = Shared::default();
         let t = Instant::now();
-        let mut injected = override_state(t);
-        note_override_key(&mut injected, 0xA0, false, "injected", t);
-        note_override_key(&mut injected, 0xA0, true, "injected", t + Duration::from_millis(100));
-        assert!(!injected.user_chinese);
+        s.override_until = Some(t + Duration::from_secs(5));
+        note_override_key(&mut s, 0xA0, false, "physical", t);
+        note_override_key(&mut s, 0x11, true, "physical", t + Duration::from_millis(20));
+        note_override_key(&mut s, 0x11, false, "physical", t + Duration::from_millis(40));
+        note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(100));
+        assert!(!s.user_chinese);
+    }
 
-        let mut held = override_state(t);
-        note_override_key(&mut held, 0xA0, false, "physical", t);
+    #[test]
+    fn injected_shift_is_ignored() {
+        let mut s = Shared::default();
+        let t = Instant::now();
+        s.override_until = Some(t + Duration::from_secs(5));
+        note_override_key(&mut s, 0xA0, false, "injected", t);
+        note_override_key(&mut s, 0xA0, true, "injected", t + Duration::from_millis(100));
+        assert!(!s.user_chinese);
+    }
+
+    #[test]
+    fn long_hold_is_ignored() {
+        let mut s = Shared::default();
+        let t = Instant::now();
+        s.override_until = Some(t + Duration::from_secs(5));
+        note_override_key(&mut s, 0xA0, false, "physical", t);
         note_override_key(
-            &mut held,
+            &mut s,
             0xA0,
             true,
             "physical",
             t + USER_SHIFT_TAP_MAX + Duration::from_millis(1),
         );
-        assert!(!held.user_chinese);
+        assert!(!s.user_chinese);
+    }
+
+    #[test]
+    fn hook_needed_respects_override_window() {
+        let mut s = Shared::default();
+        assert!(!hook_needed(&s));
+        let t = Instant::now();
+        s.override_until = Some(t + Duration::from_secs(1));
+        assert!(hook_needed(&s));
+        s.override_until = Some(t - Duration::from_millis(1));
+        expire_override(&mut s);
+        assert!(!hook_needed(&s));
     }
 }

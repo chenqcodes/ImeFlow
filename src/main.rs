@@ -106,6 +106,7 @@ fn main() {
             tracing::error!("key_trace start failed: {e}");
             std::process::exit(1);
         }
+        key_trace::pin_for_session();
     }
 
     let rules_path = resolve_rules_path();
@@ -122,7 +123,6 @@ fn main() {
     };
 
     let bus = FeedbackBus::default();
-    key_trace::bind_feedback(bus.clone());
     debug_ui::init(bus.clone());
     if let Err(e) = tray::install(bus.clone(), true) {
         key_trace::stop();
@@ -1059,8 +1059,6 @@ fn on_watch(
                 applied: true,
                 confirmed,
             });
-            // Count as effective only if the user types next without first correcting via Shift.
-            key_trace::arm_effective_check(Duration::from_secs(45));
             tray::refresh();
             debug_ui::set_extra(|e| {
                 e.snapshot = after;

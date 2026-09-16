@@ -17,7 +17,7 @@ use windows::Win32::System::Com::{
 static ASSETS: OnceCell<Result<UiAssets, String>> = OnceCell::new();
 
 pub struct UiAssets {
-    // Ordered Chinese, English, paused, neutral. Each state has its own source PNG.
+    // Ordered Chinese, English, paused, idle/unknown.
     pub icons: [Image; 4],
 }
 
@@ -54,10 +54,10 @@ fn load_from(dir: &Path) -> Result<UiAssets, String> {
     };
     Ok(UiAssets {
         icons: [
-            load("icons/imeflow_tray_zh.png")?,
-            load("icons/imeflow_tray_en.png")?,
-            load("icons/imeflow_tray_off.png")?,
-            load("icons/imeflow_tray_neutral.png")?,
+            load("icons/imeflow_zh.png")?,
+            load("icons/imeflow_en.png")?,
+            load("icons/imeflow_off.png")?,
+            load("icons/imeflow.png")?,
         ],
     })
 }
@@ -121,5 +121,7 @@ mod tests {
         let loaded = load_from(&dir).unwrap();
         assert_eq!(loaded.icons.len(), 4);
         assert!(loaded.icons.iter().all(|i| i.width > 0 && i.height > 0));
+        assert_ne!(loaded.icons[0].pixels, loaded.icons[1].pixels);
+        assert_ne!(loaded.icons[0].pixels, loaded.icons[2].pixels);
     }
 }
