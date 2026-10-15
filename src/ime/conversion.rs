@@ -1,4 +1,5 @@
-//! IME mode requests. A Shift fallback is one pulse, never a retry loop.
+use super::transaction::Transaction;
+// IME mode requests. A Shift fallback is one pulse, never a retry loop.
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::Ime::{
@@ -7,8 +8,8 @@ use windows::Win32::UI::Input::Ime::{
     IME_CONVERSION_MODE, IME_SENTENCE_MODE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetGUIThreadInfo, GetWindowThreadProcessId, SendMessageTimeoutW, GUITHREADINFO,
@@ -27,62 +28,135 @@ pub const IMEF_EXTRA: usize = 0x494D4546;
 pub fn read_ime_status(hwnd: HWND) -> (Option<bool>, Option<bool>) {
     for candidate in target_hwnds(hwnd) {
         if let Some(value) = read_via_himc(candidate) {
-            if value.1.is_some() { return value; }
+            if value.1.is_some() {
+                return value;
+            }
         }
         let value = read_via_ime_wnd(candidate);
-        if value.1.is_some() { return value; }
+        if value.1.is_some() {
+            return value;
+        }
     }
     (None, None)
 }
 
-pub fn set_native_mode(hwnd: HWND, native: bool) -> Result<(), String> {
-    let target = crate::process::InputTarget::capture(hwnd)?;
+pub fn set_native_mode(hwnd: HWND, native: bool, transaction: &Transaction) -> Result<(), String> {
     // Do not trust a matching IMM read as proof of effective mode. We have observed
     // ChatGPT/Codex report native=true while the real edit path is still in IME English.
     let mut last_err = String::from("no conversion path");
     for candidate in target_hwnds(hwnd) {
-        target.ensure_current()?;
-        match set_via_himc(candidate, native) {
+        transaction.ensure_current()?;
+        ensure_non_wechat(hwnd)?;
+        match set_via_himc(candidate, native, transaction) {
             Ok(()) if read_ime_status(hwnd).1 == Some(native) => return Ok(()),
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) => last_err = e,
         }
-        target.ensure_current()?;
-        match set_via_ime_wnd(candidate, native) {
+        transaction.ensure_current()?;
+        ensure_non_wechat(hwnd)?;
+        match set_via_ime_wnd(candidate, native, transaction) {
             Ok(()) if read_ime_status(hwnd).1 == Some(native) => return Ok(()),
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) => last_err = e,
         }
     }
-    target.ensure_current()?;
+    transaction.ensure_current()?;
     tracing::debug!(%last_err, "IMM path not confirmed; considering one Shift only");
-    toggle_via_shift(hwnd, native)
+    toggle_via_shift(hwnd, native, transaction)
 }
 
-/// Integrated terminal → IME English: wait for hwndFocus quiet, then one Shift.
-/// Caller must only reach here after a trusted backend plan says Shift.
-pub fn terminal_pulse_ime_english(hwnd: HWND) -> Result<(), String> {
+fn ensure_non_wechat(hwnd: HWND) -> Result<(), String> {
+    if super::ImeController::read(hwnd).layout.backend == super::ActiveIme::WeChatIme {
+        return Err("backend changed to WeChat; stop legacy IMM/Shift path".into());
+    }
+    Ok(())
+}
+
+/// Recheck after focus settling, including the same-app Chinese edit path. Never mix
+/// an IMM write with a fallback toggle for WeChat: either skip or send one guarded Shift.
+pub fn set_wechat_mode(
+    hwnd: HWND,
+    target: crate::mode::TargetMode,
+    transaction: &Transaction,
+) -> Result<super::ImeSnapshot, String> {
+    use super::{planner, ImeController};
+    transaction.ensure_current()?;
+    let first = ImeController::read(hwnd);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    transaction.ensure_current()?;
+    let current = ImeController::read(hwnd);
+    transaction.ensure_current()?;
+    match planner::wechat_recheck(&first, &current, target) {
+        planner::SwitchPlan::Skip { .. } => {
+            tracing::info!(?target, open = ?current.open, native = ?current.conversion_native,
+                "wechat already matches before write; no Shift (unconfirmed)");
+            return Ok(current);
+        }
+        planner::SwitchPlan::Defer => {
+            return Err("wechat mode unknown/changed or backend changed; no Shift".into())
+        }
+        planner::SwitchPlan::Apply => {}
+    }
+    tap_scancode(0x2A, Some(transaction))?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    transaction.ensure_current()?;
+    let after = ImeController::read(hwnd);
+    transaction.ensure_current()?;
+    tracing::info!(?target, before = %current.describe(), after = %after.describe(),
+        "wechat guarded Shift; outcome unconfirmed; no retry");
+    Ok(after)
+}
+
+fn pulse_ime_english_direct(
+    hwnd: HWND,
+    reason: &str,
+    transaction: &Transaction,
+) -> Result<(), String> {
+    transaction.ensure_current()?;
+    ensure_non_wechat(hwnd)?;
+    let imm_before = read_ime_status(hwnd);
+    tap_scancode(0x2A, Some(transaction))?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let imm_after = read_ime_status(hwnd);
+    tracing::info!(
+        reason,
+        focus = format!("{:x}", transaction.focus_hwnd() as usize),
+        imm_before = ?imm_before,
+        imm_after = ?imm_after,
+        "pulse: one Shift → expected 英"
+    );
+    Ok(())
+}
+
+pub fn wait_terminal_focus(hwnd: HWND) -> Result<(), String> {
     let quiet = crate::process::wait_focus_quiet(
         hwnd,
         std::time::Duration::from_millis(120),
         std::time::Duration::from_millis(800),
     )?;
     quiet.ensure_current()?;
-    tap_left_shift_scancode()?;
-    tracing::info!(
-        focus = format!("{:x}", quiet.focus as usize),
-        "terminal: focus quiet → one Shift → expected 英; no IMM skip"
-    );
+    Ok(())
+}
+
+/// Trusted backends retain their terminal path; WeChat uses set_wechat_mode instead.
+pub fn terminal_pulse_ime_english(hwnd: HWND, transaction: &Transaction) -> Result<(), String> {
+    wait_terminal_focus(hwnd)?;
+    pulse_ime_english_direct(hwnd, "terminal_en_direct", transaction)?;
     Ok(())
 }
 
 pub fn modifiers_down() -> bool {
     [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
-        .iter().any(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) < 0 })
+        .iter()
+        .any(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) < 0 })
 }
 
-fn toggle_via_shift(hwnd: HWND, want_native: bool) -> Result<(), String> {
-    let target = crate::process::InputTarget::capture(hwnd)?;
+fn toggle_via_shift(
+    hwnd: HWND,
+    want_native: bool,
+    transaction: &Transaction,
+) -> Result<(), String> {
+    ensure_non_wechat(hwnd)?;
     let before = read_ime_status(hwnd).1;
     match before {
         Some(value) if value == want_native => {
@@ -90,23 +164,26 @@ fn toggle_via_shift(hwnd: HWND, want_native: bool) -> Result<(), String> {
             return Ok(());
         }
         None => return Err("shift skipped: unknown initial mode; cannot safely toggle".into()),
-        _ => {},
+        _ => {}
     }
-    target.ensure_current()?;
-    tap_left_shift_scancode()?;
-    tracing::info!(want_native, "shift: pulses=1, outcome=applied_unverified; no retry");
+    transaction.ensure_current()?;
+    tap_scancode(0x2A, Some(transaction))?;
+    tracing::info!(
+        want_native,
+        "shift: pulses=1, outcome=applied_unverified; no retry"
+    );
     // Do not inspect a potentially stale IMM value and toggle again.
     Ok(())
 }
 
 /// Inserts exactly one left-Shift down/up pair. No retry loop.
 pub fn tap_left_shift_scancode() -> Result<(), String> {
-    tap_scancode(0x2A)
+    tap_scancode(0x2A, None)
 }
 
 /// Phase-1 letter probe (`b`). Opt-in only — will type into the focused control.
 pub fn tap_probe_letter_b() -> Result<(), String> {
-    tap_scancode(0x30)
+    tap_scancode(0x30, None)
 }
 
 fn key_input(scan: u16, up: bool) -> INPUT {
@@ -129,7 +206,13 @@ fn key_input(scan: u16, up: bool) -> INPUT {
     }
 }
 
-fn tap_scancode(scan: u16) -> Result<(), String> {
+fn tap_scancode(scan: u16, transaction: Option<&Transaction>) -> Result<(), String> {
+    if modifiers_down() {
+        return Err("key skipped: user is holding a modifier".into());
+    }
+    if let Some(transaction) = transaction {
+        transaction.ensure_current()?;
+    }
     if modifiers_down() {
         return Err("key skipped: user is holding a modifier".into());
     }
@@ -140,10 +223,19 @@ fn tap_scancode(scan: u16) -> Result<(), String> {
             std::mem::size_of::<INPUT>() as i32,
         )
     };
+    if sent > 0 {
+        if let Some(transaction) = transaction {
+            transaction.note_effect();
+        }
+    }
     if sent != 2 {
         if sent == 1 {
             let released = unsafe { SendInput(&[up], std::mem::size_of::<INPUT>() as i32) };
-            tracing::warn!(scan, released, "partial key insertion; release-only cleanup");
+            tracing::warn!(
+                scan,
+                released,
+                "partial key insertion; release-only cleanup"
+            );
         }
         return Err(format!("SendInput scan={scan:#x} inserted={sent}/2"));
     }
@@ -153,7 +245,9 @@ fn tap_scancode(scan: u16) -> Result<(), String> {
 fn target_hwnds(hwnd: HWND) -> Vec<HWND> {
     let mut targets = Vec::new();
     if let Some(focus) = focus_hwnd_of(hwnd) {
-        if focus.0 != hwnd.0 { targets.push(focus); }
+        if focus.0 != hwnd.0 {
+            targets.push(focus);
+        }
     }
     targets.push(hwnd);
     targets
@@ -161,19 +255,29 @@ fn target_hwnds(hwnd: HWND) -> Vec<HWND> {
 
 fn focus_hwnd_of(hwnd: HWND) -> Option<HWND> {
     let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
-    if tid == 0 { return None; }
+    if tid == 0 {
+        return None;
+    }
     let mut info = GUITHREADINFO {
         cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
         ..Default::default()
     };
-    unsafe { GetGUIThreadInfo(tid, &mut info).ok()?; }
-    if info.hwndFocus.0.is_null() { None } else { Some(info.hwndFocus) }
+    unsafe {
+        GetGUIThreadInfo(tid, &mut info).ok()?;
+    }
+    if info.hwndFocus.0.is_null() {
+        None
+    } else {
+        Some(info.hwndFocus)
+    }
 }
 
 fn read_via_himc(hwnd: HWND) -> Option<(Option<bool>, Option<bool>)> {
     unsafe {
         let himc = ImmGetContext(hwnd);
-        if himc.is_invalid() { return None; }
+        if himc.is_invalid() {
+            return None;
+        }
         let open = ImmGetOpenStatus(himc).as_bool();
         let mut conv = IME_CONVERSION_MODE(0);
         let mut sent = IME_SENTENCE_MODE(0);
@@ -183,11 +287,13 @@ fn read_via_himc(hwnd: HWND) -> Option<(Option<bool>, Option<bool>)> {
     }
 }
 
-fn set_via_himc(hwnd: HWND, native: bool) -> Result<(), String> {
+fn set_via_himc(hwnd: HWND, native: bool, transaction: &Transaction) -> Result<(), String> {
     unsafe {
         let himc = ImmGetContext(hwnd);
-        if himc.is_invalid() { return Err("no HIMC".into()); }
-        let result = apply_himc(himc, native);
+        if himc.is_invalid() {
+            return Err("no HIMC".into());
+        }
+        let result = apply_himc(hwnd, himc, native, transaction);
         let _ = ImmReleaseContext(hwnd, himc);
         result
     }
@@ -195,44 +301,82 @@ fn set_via_himc(hwnd: HWND, native: bool) -> Result<(), String> {
 
 fn ime_wnd(hwnd: HWND) -> Result<HWND, String> {
     let wnd = unsafe { ImmGetDefaultIMEWnd(hwnd) };
-    if wnd.0.is_null() { Err("ImmGetDefaultIMEWnd null".into()) } else { Ok(wnd) }
+    if wnd.0.is_null() {
+        Err("ImmGetDefaultIMEWnd null".into())
+    } else {
+        Ok(wnd)
+    }
 }
 
 fn ime_control(wnd: HWND, command: usize, value: isize) -> Result<usize, String> {
     let mut result = 0usize;
     let ok = unsafe {
-        SendMessageTimeoutW(wnd, WM_IME_CONTROL, WPARAM(command), LPARAM(value),
-            SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, Some(&mut result))
+        SendMessageTimeoutW(
+            wnd,
+            WM_IME_CONTROL,
+            WPARAM(command),
+            LPARAM(value),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            100,
+            Some(&mut result),
+        )
     };
-    if ok.0 == 0 { Err(format!("WM_IME_CONTROL {command:#x} failed/timed out")) }
-    else { Ok(result) }
+    if ok.0 == 0 {
+        Err(format!("WM_IME_CONTROL {command:#x} failed/timed out"))
+    } else {
+        Ok(result)
+    }
 }
 
 fn read_via_ime_wnd(hwnd: HWND) -> (Option<bool>, Option<bool>) {
-    let Ok(wnd) = ime_wnd(hwnd) else { return (None, None) };
+    let Ok(wnd) = ime_wnd(hwnd) else {
+        return (None, None);
+    };
     let open = ime_control(wnd, IMC_GETOPENSTATUS, 0).ok().map(|v| v != 0);
-    let native = ime_control(wnd, IMC_GETCONVERSIONMODE, 0).ok()
+    let native = ime_control(wnd, IMC_GETCONVERSIONMODE, 0)
+        .ok()
         .map(|v| (v as u32 & IME_CMODE_NATIVE.0) != 0);
     (open, native)
 }
 
-fn set_via_ime_wnd(hwnd: HWND, native: bool) -> Result<(), String> {
+fn set_via_ime_wnd(hwnd: HWND, native: bool, transaction: &Transaction) -> Result<(), String> {
     let wnd = ime_wnd(hwnd)?;
+    ensure_non_wechat(hwnd)?;
+    transaction.before_write()?;
     ime_control(wnd, IMC_SETOPENSTATUS, 1)?;
     let current = ime_control(wnd, IMC_GETCONVERSIONMODE, 0)? as u32;
-    let next = if native { current | IME_CMODE_NATIVE.0 } else { current & !IME_CMODE_NATIVE.0 };
+    let next = if native {
+        current | IME_CMODE_NATIVE.0
+    } else {
+        current & !IME_CMODE_NATIVE.0
+    };
+    ensure_non_wechat(hwnd)?;
+    transaction.before_write()?;
     ime_control(wnd, IMC_SETCONVERSIONMODE, next as isize)?;
     Ok(())
 }
 
-unsafe fn apply_himc(himc: windows::Win32::UI::Input::Ime::HIMC, native: bool) -> Result<(), String> {
+unsafe fn apply_himc(
+    hwnd: HWND,
+    himc: windows::Win32::UI::Input::Ime::HIMC,
+    native: bool,
+    transaction: &Transaction,
+) -> Result<(), String> {
+    ensure_non_wechat(hwnd)?;
+    transaction.before_write()?;
     let _ = ImmSetOpenStatus(himc, true);
     let mut conv = IME_CONVERSION_MODE(0);
     let mut sent = IME_SENTENCE_MODE(0);
     if !ImmGetConversionStatus(himc, Some(&mut conv), Some(&mut sent)).as_bool() {
         return Err("ImmGetConversionStatus failed".into());
     }
-    if native { conv.0 |= IME_CMODE_NATIVE.0; } else { conv.0 &= !IME_CMODE_NATIVE.0; }
+    if native {
+        conv.0 |= IME_CMODE_NATIVE.0;
+    } else {
+        conv.0 &= !IME_CMODE_NATIVE.0;
+    }
+    ensure_non_wechat(hwnd)?;
+    transaction.before_write()?;
     if !ImmSetConversionStatus(himc, conv, sent).as_bool() {
         return Err("ImmSetConversionStatus failed".into());
     }

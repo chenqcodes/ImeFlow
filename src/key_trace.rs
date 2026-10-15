@@ -3,26 +3,22 @@
 
 use parking_lot::Mutex;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    CallNextHookEx, DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostThreadMessageW,
+    SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
     LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, PM_REMOVE, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER,
 };
 
 use crate::ime::IMEF_EXTRA;
 
-static STARTED: AtomicBool = AtomicBool::new(false);
 static PINNED: AtomicBool = AtomicBool::new(false);
-static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
-/// Bumps invalidate delayed idle-release timers when we re-arm or clear early.
-static RELEASE_GEN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ShiftPulse {
@@ -63,11 +59,7 @@ impl ShiftWatchReport {
                 p.extra
             ));
         }
-        let ours = self
-            .pulses
-            .iter()
-            .filter(|p| p.source == "imeflow")
-            .count();
+        let ours = self.pulses.iter().filter(|p| p.source == "imeflow").count();
         let injected = self
             .pulses
             .iter()
@@ -140,85 +132,184 @@ pub fn pin_for_session() {
     PINNED.store(true, Ordering::SeqCst);
 }
 
-/// Install WH_KEYBOARD_LL on a dedicated thread (must pump messages).
-pub fn start() -> Result<(), String> {
-    if STARTED.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    std::thread::Builder::new()
+// The worker/message queue stays alive; only the OS hook is installed/uninstalled lazily.
+// Ensure and idle-release commands are serialized on that thread, never asynchronous WM_QUIT.
+const WM_HOOK_COMMAND: u32 = WM_USER + 130;
+enum HookCommand {
+    Ensure(std::sync::mpsc::Sender<Result<(), String>>),
+    ReleaseIfIdle,
+    ReleaseAfter(Duration),
+    #[cfg(test)]
+    IsInstalled(std::sync::mpsc::Sender<bool>),
+    Shutdown,
+}
+struct HookWorker {
+    tid: u32,
+    sender: std::sync::mpsc::Sender<HookCommand>,
+    thread: std::thread::JoinHandle<()>,
+}
+static WORKER: Mutex<Option<HookWorker>> = Mutex::new(None);
+
+fn spawn_worker() -> Result<HookWorker, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (ready, wait_ready) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
         .name("imeflow-key-trace".into())
         .spawn(move || {
-            match install_hook() {
-                Ok(hook) => {
-                    let _ = tx.send(Ok(()));
-                    run_hook_loop(hook);
+            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            unsafe {
+                let _ = PeekMessageW(&mut msg, None, 0, 0, Default::default());
+            }
+            let _ = ready.send(unsafe { GetCurrentThreadId() });
+            let mut hook: Option<HHOOK> = None;
+            let mut release_timer = 0;
+            loop {
+                let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+                if result.0 <= 0 {
+                    break;
                 }
-                Err(e) => {
-                    STARTED.store(false, Ordering::SeqCst);
-                    let _ = tx.send(Err(e));
+                if msg.message == WM_HOOK_COMMAND {
+                    match receiver.try_recv() {
+                        Ok(HookCommand::Ensure(reply)) => {
+                            let result = if hook.is_some() {
+                                Ok(())
+                            } else {
+                                install_hook().map(|installed| {
+                                    hook = Some(installed);
+                                })
+                            };
+                            let _ = reply.send(result);
+                        }
+                        Ok(HookCommand::ReleaseIfIdle) => {
+                            if release_hook_if_idle(&mut hook) && release_timer != 0 {
+                                unsafe {
+                                    let _ = KillTimer(None, release_timer);
+                                }
+                                release_timer = 0;
+                            }
+                        }
+                        Ok(HookCommand::ReleaseAfter(delay)) => {
+                            if release_timer != 0 {
+                                unsafe {
+                                    let _ = KillTimer(None, release_timer);
+                                }
+                            }
+                            release_timer = unsafe {
+                                SetTimer(
+                                    None,
+                                    0,
+                                    delay.as_millis().clamp(1, u32::MAX as u128) as u32,
+                                    None,
+                                )
+                            };
+                            if release_timer == 0 {
+                                tracing::warn!("key_trace: idle release timer unavailable");
+                            }
+                        }
+                        Ok(HookCommand::Shutdown) => break,
+                        #[cfg(test)]
+                        Ok(HookCommand::IsInstalled(reply)) => {
+                            let _ = reply.send(hook.is_some());
+                        }
+                        Err(_) => {}
+                    }
+                } else if msg.message == WM_TIMER
+                    && release_timer != 0
+                    && msg.wParam.0 == release_timer
+                {
+                    unsafe {
+                        let _ = KillTimer(None, release_timer);
+                    }
+                    release_timer = 0;
+                    release_hook_if_idle(&mut hook);
+                } else {
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+            if release_timer != 0 {
+                unsafe {
+                    let _ = KillTimer(None, release_timer);
+                }
+            }
+            if let Some(installed) = hook {
+                unsafe {
+                    let _ = UnhookWindowsHookEx(installed);
                 }
             }
         })
-        .map_err(|e| {
-            STARTED.store(false, Ordering::SeqCst);
-            format!("key_trace thread: {e}")
-        })?;
-    rx.recv()
-        .map_err(|e| {
-            STARTED.store(false, Ordering::SeqCst);
-            format!("key_trace start: {e}")
-        })?
+        .map_err(|e| format!("key_trace thread: {e}"))?;
+    let tid = wait_ready
+        .recv()
+        .map_err(|e| format!("key_trace worker ready: {e}"))?;
+    Ok(HookWorker {
+        tid,
+        sender,
+        thread,
+    })
 }
-
+fn send_command(worker: &HookWorker, command: HookCommand) -> Result<(), String> {
+    worker
+        .sender
+        .send(command)
+        .map_err(|e| format!("key_trace command: {e}"))?;
+    unsafe { PostThreadMessageW(worker.tid, WM_HOOK_COMMAND, WPARAM(0), LPARAM(0)) }
+        .map_err(|e| format!("key_trace wake: {e}"))
+}
+pub fn start() -> Result<(), String> {
+    let (reply, result) = std::sync::mpsc::channel();
+    {
+        let mut worker = WORKER.lock();
+        if worker.as_ref().is_some_and(|w| w.thread.is_finished()) {
+            worker.take();
+        }
+        if worker.is_none() {
+            *worker = Some(spawn_worker()?);
+        }
+        send_command(worker.as_ref().unwrap(), HookCommand::Ensure(reply))?;
+    }
+    result.recv().map_err(|e| format!("key_trace arm: {e}"))?
+}
 fn install_hook() -> Result<HHOOK, String> {
     let module = unsafe { GetModuleHandleW(None) }.map_err(|e| format!("GetModuleHandleW: {e}"))?;
-    let hook = unsafe {
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_proc), module, 0)
-    }
-    .map_err(|e| format!("SetWindowsHookExW WH_KEYBOARD_LL: {e}"))?;
-    HOOK_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_proc), module, 0) }
+        .map_err(|e| format!("SetWindowsHookExW WH_KEYBOARD_LL: {e}"))?;
     tracing::info!("key_trace: WH_KEYBOARD_LL armed on dedicated thread");
     Ok(hook)
 }
-
-fn run_hook_loop(hook: HHOOK) {
-    let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
-    loop {
-        let ok = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if ok.0 == 0 || ok.0 == -1 {
-            break;
-        }
-        unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    unsafe {
-        let _ = UnhookWindowsHookEx(hook);
-    }
-    HOOK_THREAD.store(0, Ordering::SeqCst);
-    STARTED.store(false, Ordering::SeqCst);
-    tracing::info!("key_trace: WH_KEYBOARD_LL released");
-}
-
 pub fn stop() {
-    let tid = HOOK_THREAD.swap(0, Ordering::SeqCst);
-    if tid != 0 {
-        unsafe {
-            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+    let worker = WORKER.lock().take();
+    if let Some(worker) = worker {
+        if send_command(&worker, HookCommand::Shutdown).is_ok() {
+            let _ = worker.thread.join();
         }
     }
 }
-
 fn hook_needed(shared: &Shared) -> bool {
     if shared.arm.is_some() {
         return true;
     }
-    match shared.override_until {
-        Some(until) if Instant::now() <= until => true,
-        _ => false,
+    matches!(shared.override_until, Some(until) if Instant::now() <= until)
+}
+
+fn release_hook_if_idle(hook: &mut Option<HHOOK>) -> bool {
+    let needed = {
+        let mut shared = SHARED.lock();
+        expire_override(&mut shared);
+        hook_needed(&shared)
+    };
+    if PINNED.load(Ordering::SeqCst) || needed {
+        return false;
     }
+    if let Some(installed) = hook.take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(installed);
+        }
+        tracing::info!("key_trace: WH_KEYBOARD_LL released; worker idle");
+    }
+    true
 }
 
 fn expire_override(shared: &mut Shared) {
@@ -232,33 +323,20 @@ fn expire_override(shared: &mut Shared) {
 }
 
 /// Drop the LL hook when nothing is listening. Safe to call from the hook callback
-/// (only posts WM_QUIT; Unhook runs after the callback returns).
+/// (only queues a command; Unhook runs after the callback returns).
 fn release_if_idle() {
-    if PINNED.load(Ordering::SeqCst) {
-        return;
-    }
-    let needed = {
-        let mut shared = SHARED.lock();
-        expire_override(&mut shared);
-        hook_needed(&shared)
-    };
-    if !needed {
-        stop();
+    if let Some(worker) = WORKER.lock().as_ref() {
+        if let Err(error) = send_command(worker, HookCommand::ReleaseIfIdle) {
+            tracing::warn!(%error, "key_trace idle release failed");
+        }
     }
 }
-
 fn schedule_release_after(delay: Duration) {
-    let gen = RELEASE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    std::thread::Builder::new()
-        .name("imeflow-hook-idle".into())
-        .spawn(move || {
-            std::thread::sleep(delay);
-            if RELEASE_GEN.load(Ordering::SeqCst) != gen {
-                return;
-            }
-            release_if_idle();
-        })
-        .ok();
+    if let Some(worker) = WORKER.lock().as_ref() {
+        if let Err(error) = send_command(worker, HookCommand::ReleaseAfter(delay)) {
+            tracing::warn!(%error, "key_trace release scheduling failed");
+        }
+    }
 }
 
 /// Begin collecting VK_SHIFT for `window` after the next terminal Shift pulse.
@@ -309,16 +387,18 @@ pub fn cancel_shift_window() {
 /// terminal→英 之后武装：用户非 ImeFlow 的 Shift → take_user_chinese_override。
 /// 懒启动 LL hook（不必开 --trace-keys）；窗口结束后自动卸钩。
 pub fn arm_user_override(window: Duration) {
-    if let Err(e) = start() {
-        tracing::warn!(%e, "user-override arm skipped (hook start failed)");
-        return;
-    }
     {
         let mut shared = SHARED.lock();
         shared.override_until = Some(Instant::now() + window);
         shared.user_chinese = false;
         shared.shift_tap = None;
         shared.non_shift_down.clear();
+    }
+    // Arm shared intent before Ensure, so a queued idle-release cannot unhook the new window.
+    if let Err(error) = start() {
+        clear_user_override();
+        tracing::warn!(%error, "user-override arm skipped (hook start failed)");
+        return;
     }
     // +200ms slack so the last key in the window is still observed.
     schedule_release_after(window + Duration::from_millis(200));
@@ -329,7 +409,6 @@ pub fn arm_user_override(window: Duration) {
 }
 
 pub fn clear_user_override() {
-    RELEASE_GEN.fetch_add(1, Ordering::SeqCst);
     {
         let mut shared = SHARED.lock();
         shared.override_until = None;
@@ -356,7 +435,6 @@ pub fn take_user_chinese_override() -> bool {
         hit
     };
     if hit {
-        RELEASE_GEN.fetch_add(1, Ordering::SeqCst);
         release_if_idle();
     }
     hit
@@ -367,12 +445,7 @@ fn pump_once() {
     while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
         if msg.message == WM_QUIT {
             unsafe {
-                let _ = PostThreadMessageW(
-                    GetCurrentThreadId(),
-                    WM_QUIT,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ = PostThreadMessageW(GetCurrentThreadId(), WM_QUIT, WPARAM(0), LPARAM(0));
             }
             break;
         }
@@ -433,17 +506,25 @@ fn note_override_key(shared: &mut Shared, vk: u32, up: bool, source: &'static st
             return;
         }
 
-        let Some(candidate) = shared.shift_tap.take() else { return };
+        let Some(candidate) = shared.shift_tap.take() else {
+            return;
+        };
         let held = now.saturating_duration_since(candidate.started);
         if !candidate.dirty && held <= USER_SHIFT_TAP_MAX {
             // The arm starts immediately after an automatic terminal→英 pulse. Clean manual
             // taps toggle from that baseline, so parity matters: one tap = 中, two taps = 英.
             shared.user_chinese = !shared.user_chinese;
-            tracing::info!(held_ms = held.as_millis() as u64, manual_chinese = shared.user_chinese,
-                "key_trace: clean physical Shift tap → toggle manual override parity");
+            tracing::info!(
+                held_ms = held.as_millis() as u64,
+                manual_chinese = shared.user_chinese,
+                "key_trace: clean physical Shift tap → toggle manual override parity"
+            );
         } else {
-            tracing::debug!(dirty = candidate.dirty, held_ms = held.as_millis() as u64,
-                "key_trace: Shift chord/hold ignored for IME override");
+            tracing::debug!(
+                dirty = candidate.dirty,
+                held_ms = held.as_millis() as u64,
+                "key_trace: Shift chord/hold ignored for IME override"
+            );
         }
         return;
     }
@@ -467,6 +548,16 @@ fn note_key(kb: &KBDLLHOOKSTRUCT, up: bool) {
     let source = classify_shift_source(extra, flags);
     let now = Instant::now();
     let vk = kb.vkCode;
+    if is_shift_vk(vk) {
+        // Shift only, while the existing lazy/explicit hook is active. Never log typed keys.
+        tracing::debug!(
+            source,
+            up,
+            scan = kb.scanCode,
+            flags,
+            "key_trace: Shift observed; forwarded to system"
+        );
+    }
 
     let idle = {
         let mut shared = SHARED.lock();
@@ -491,7 +582,7 @@ fn note_key(kb: &KBDLLHOOKSTRUCT, up: bool) {
         expire_override(&mut shared);
         !hook_needed(&shared)
     };
-    // Post quit only; Unhook runs after this callback returns.
+    // Queue idle release; the worker rechecks current arm state after this callback.
     if idle {
         release_if_idle();
     }
@@ -502,8 +593,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queued_idle_release_and_rearm_keep_worker_and_hook_alive() {
+        let worker = spawn_worker().unwrap();
+        for _ in 0..20 {
+            send_command(&worker, HookCommand::ReleaseIfIdle).unwrap();
+            let (reply, result) = std::sync::mpsc::channel();
+            send_command(&worker, HookCommand::Ensure(reply)).unwrap();
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            let (reply, state) = std::sync::mpsc::channel();
+            send_command(&worker, HookCommand::IsInstalled(reply)).unwrap();
+            assert!(state.recv_timeout(Duration::from_secs(2)).unwrap());
+            assert!(!worker.thread.is_finished());
+        }
+        send_command(&worker, HookCommand::Shutdown).unwrap();
+        worker.thread.join().unwrap();
+    }
+
+    #[test]
     fn classify_prefers_imeflow_tag() {
-        assert_eq!(classify_shift_source(IMEF_EXTRA, LLKHF_INJECTED.0), "imeflow");
+        assert_eq!(
+            classify_shift_source(IMEF_EXTRA, LLKHF_INJECTED.0),
+            "imeflow"
+        );
         assert_eq!(classify_shift_source(0, LLKHF_INJECTED.0), "injected");
         assert_eq!(classify_shift_source(0, 0), "physical");
     }
@@ -544,10 +658,28 @@ mod tests {
         let t = Instant::now();
         s.override_until = Some(t + Duration::from_secs(5));
         note_override_key(&mut s, 0xA0, false, "physical", t);
-        note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(120));
+        note_override_key(
+            &mut s,
+            0xA0,
+            true,
+            "physical",
+            t + Duration::from_millis(120),
+        );
         assert!(s.user_chinese);
-        note_override_key(&mut s, 0xA0, false, "physical", t + Duration::from_millis(200));
-        note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(280));
+        note_override_key(
+            &mut s,
+            0xA0,
+            false,
+            "physical",
+            t + Duration::from_millis(200),
+        );
+        note_override_key(
+            &mut s,
+            0xA0,
+            true,
+            "physical",
+            t + Duration::from_millis(280),
+        );
         assert!(!s.user_chinese);
     }
 
@@ -557,8 +689,20 @@ mod tests {
         let t = Instant::now();
         s.override_until = Some(t + Duration::from_secs(5));
         note_override_key(&mut s, 0x41, false, "physical", t);
-        note_override_key(&mut s, 0xA0, false, "physical", t + Duration::from_millis(30));
-        note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(80));
+        note_override_key(
+            &mut s,
+            0xA0,
+            false,
+            "physical",
+            t + Duration::from_millis(30),
+        );
+        note_override_key(
+            &mut s,
+            0xA0,
+            true,
+            "physical",
+            t + Duration::from_millis(80),
+        );
         assert!(!s.user_chinese);
     }
 
@@ -568,9 +712,27 @@ mod tests {
         let t = Instant::now();
         s.override_until = Some(t + Duration::from_secs(5));
         note_override_key(&mut s, 0xA0, false, "physical", t);
-        note_override_key(&mut s, 0x11, true, "physical", t + Duration::from_millis(20));
-        note_override_key(&mut s, 0x11, false, "physical", t + Duration::from_millis(40));
-        note_override_key(&mut s, 0xA0, true, "physical", t + Duration::from_millis(100));
+        note_override_key(
+            &mut s,
+            0x11,
+            true,
+            "physical",
+            t + Duration::from_millis(20),
+        );
+        note_override_key(
+            &mut s,
+            0x11,
+            false,
+            "physical",
+            t + Duration::from_millis(40),
+        );
+        note_override_key(
+            &mut s,
+            0xA0,
+            true,
+            "physical",
+            t + Duration::from_millis(100),
+        );
         assert!(!s.user_chinese);
     }
 
@@ -580,7 +742,13 @@ mod tests {
         let t = Instant::now();
         s.override_until = Some(t + Duration::from_secs(5));
         note_override_key(&mut s, 0xA0, false, "injected", t);
-        note_override_key(&mut s, 0xA0, true, "injected", t + Duration::from_millis(100));
+        note_override_key(
+            &mut s,
+            0xA0,
+            true,
+            "injected",
+            t + Duration::from_millis(100),
+        );
         assert!(!s.user_chinese);
     }
 

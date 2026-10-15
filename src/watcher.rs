@@ -147,6 +147,8 @@ impl AppWatcher {
                         continue;
                     }
                 }
+                if crate::rule_panel::handle_message(&msg) { continue; }
+                if crate::rule_manager::handle_message(&msg) { continue; }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }

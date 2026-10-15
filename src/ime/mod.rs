@@ -1,24 +1,27 @@
 //! IME read/write. Per-IME quirks live in `backends/`; core stays MsPinyin-first.
 
 mod backends;
-mod layout;
 mod conversion;
-mod tsf;
+mod layout;
+pub mod planner;
+mod transaction;
+pub mod tsf;
+pub use transaction::ApplyError;
 
 use crate::mode::TargetMode;
 use crate::uia::ControlKind;
 use windows::Win32::Foundation::HWND;
 
 pub use backends::{for_active, ImeBackend};
-pub use layout::{classify_installed_imes, ActiveIme, LayoutInfo};
 pub use conversion::{modifiers_down, tap_left_shift_scancode, tap_probe_letter_b, IMEF_EXTRA};
+pub use layout::{classify_installed_imes, ActiveIme, LayoutInfo};
 
 /// What we believe about the live 中/英 layer after reading OS signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerObservation {
     /// IMM/layout report is trustworthy enough to act on (e.g. MsPinyin).
     Confident(TargetMode),
-    /// Weak signal (legacy WeChat IMM「英」). Core does not auto-switch on this alone.
+    /// Weak IME signal. WeChat requires stable samples and a final transaction check.
     Probable(TargetMode),
     Unknown,
 }
@@ -57,7 +60,11 @@ impl ImeSnapshot {
                     Some(false) => "英",
                     None => "?",
                 };
-                let closed = if self.open == Some(false) { "(closed)" } else { "" };
+                let closed = if self.open == Some(false) {
+                    "(closed)"
+                } else {
+                    ""
+                };
                 format!("{backend}/{mode}{closed}")
             }
             ActiveIme::Unknown => format!("{backend}/{:04x}", self.layout.lang_id),
@@ -90,18 +97,27 @@ impl ImeSnapshot {
             || for_active(self.layout.backend).auto_switch_enabled()
     }
 
-    /// Resolve live layer: Confident/Probable first, else optional memory fallback.
+    /// WeChat never resolves from requested-mode memory across application contexts.
     pub fn resolve_layer(&self, memory: Option<TargetMode>) -> Option<TargetMode> {
         match self.observe_layer() {
-            LayerObservation::Confident(mode) | LayerObservation::Probable(mode) => Some(mode),
-            LayerObservation::Unknown => memory.filter(|m| {
-                matches!(m, TargetMode::NativeChinese | TargetMode::ImeEnglish)
-            }),
+            LayerObservation::Confident(mode) => Some(mode),
+            LayerObservation::Probable(mode) if self.layout.backend == ActiveIme::WeChatIme => {
+                Some(mode)
+            }
+            LayerObservation::Unknown if self.layout.backend == ActiveIme::WeChatIme => None,
+            LayerObservation::Probable(_) | LayerObservation::Unknown => {
+                memory.filter(|m| matches!(m, TargetMode::NativeChinese | TargetMode::ImeEnglish))
+            }
         }
     }
 }
 
 pub struct ImeController;
+
+pub struct ApplyOutcome {
+    pub snapshot: ImeSnapshot,
+    pub applied: bool,
+}
 
 impl ImeController {
     pub fn read(hwnd: HWND) -> ImeSnapshot {
@@ -123,7 +139,7 @@ impl ImeController {
         }
     }
 
-    pub fn apply(hwnd: HWND, target: TargetMode) -> Result<ImeSnapshot, String> {
+    pub fn apply(hwnd: HWND, target: TargetMode) -> Result<ImeSnapshot, ApplyError> {
         Self::apply_for(hwnd, target, None)
     }
 
@@ -131,16 +147,47 @@ impl ImeController {
         hwnd: HWND,
         target: TargetMode,
         kind: Option<ControlKind>,
+    ) -> Result<ImeSnapshot, ApplyError> {
+        let focus = crate::uia::inspect_focused().ok_or_else(|| ApplyError {
+            message: "UIA focus unavailable before apply".into(),
+            may_have_changed: false,
+        })?;
+        Self::apply_for_focus(hwnd, target, kind, &focus).map(|outcome| outcome.snapshot)
+    }
+
+    pub fn apply_for_focus(
+        hwnd: HWND,
+        target: TargetMode,
+        kind: Option<ControlKind>,
+        focus: &crate::uia::FocusInfo,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        let transaction =
+            transaction::Transaction::capture(hwnd, focus).map_err(|message| ApplyError {
+                message,
+                may_have_changed: false,
+            })?;
+        Self::execute(hwnd, target, kind, &transaction)
+            .map(|snapshot| ApplyOutcome {
+                snapshot,
+                applied: transaction.has_effect(),
+            })
+            .map_err(|message| transaction.error(message))
+    }
+
+    fn execute(
+        hwnd: HWND,
+        target: TargetMode,
+        kind: Option<ControlKind>,
+        transaction: &transaction::Transaction,
     ) -> Result<ImeSnapshot, String> {
         if target == TargetMode::Passthrough {
             return Ok(Self::read(hwnd));
         }
 
-        let input = crate::process::InputTarget::capture(hwnd)?;
         match target {
             TargetMode::LayoutEnglish => {
-                input.ensure_current()?;
-                layout::activate_english_layout(hwnd)?;
+                transaction.ensure_current()?;
+                layout::activate_english_layout(hwnd, transaction)?;
             }
             TargetMode::NativeChinese | TargetMode::ImeEnglish => {
                 let native = target == TargetMode::NativeChinese;
@@ -155,7 +202,16 @@ impl ImeController {
                     before.layout.backend,
                     ActiveIme::WeChatIme | ActiveIme::MsPinyin | ActiveIme::OtherChinese
                 );
-                input.ensure_current()?;
+                transaction.ensure_current()?;
+                if before.layout.backend == ActiveIme::WeChatIme {
+                    if kind == Some(ControlKind::Terminal) {
+                        if native {
+                            return Err("terminal path only switches toward IME English".into());
+                        }
+                        conversion::wait_terminal_focus(hwnd)?;
+                    }
+                    return conversion::set_wechat_mode(hwnd, target, transaction);
+                }
                 if kind == Some(ControlKind::Terminal) {
                     if !chinese {
                         return Err(
@@ -166,28 +222,29 @@ impl ImeController {
                         return Err("terminal path only pulses toward IME English".into());
                     }
                     tracing::info!("backend=terminal-focus-quiet-shift; keep active IME");
-                    conversion::terminal_pulse_ime_english(hwnd)?;
+                    conversion::terminal_pulse_ime_english(hwnd, transaction)?;
                 } else {
                     if !chinese {
-                        layout::activate_chinese_ime(hwnd)?;
+                        layout::activate_chinese_ime(hwnd, transaction)?;
                         std::thread::sleep(std::time::Duration::from_millis(80));
-                        input.ensure_current()?;
+                        transaction.ensure_current()?;
                     }
-                    conversion::set_native_mode(hwnd, native)?;
+                    // Selecting a Chinese layout may activate WeChat even if the original
+                    // snapshot was ENG; it must use the same guarded path in either direction.
+                    if Self::read(hwnd).layout.backend == ActiveIme::WeChatIme {
+                        return conversion::set_wechat_mode(hwnd, target, transaction);
+                    } else {
+                        conversion::set_native_mode(hwnd, native, transaction)?;
+                    }
                 }
             }
             TargetMode::Passthrough => {}
         }
         std::thread::sleep(std::time::Duration::from_millis(80));
-        if kind == Some(ControlKind::Terminal) {
-            let fg = crate::process::foreground_hwnd();
-            if fg.0.is_null() || crate::process::root_hwnd(fg) != crate::process::root_hwnd(hwnd) {
-                return Err("terminal root lost foreground after IME action".into());
-            }
-        } else {
-            input.ensure_current()?;
-        }
-        Ok(Self::read(hwnd))
+        transaction.ensure_current()?;
+        let snapshot = Self::read(hwnd);
+        transaction.ensure_current()?;
+        Ok(snapshot)
     }
 }
 
@@ -208,15 +265,24 @@ mod tests {
     }
 
     #[test]
-    fn wechat_auto_switch_disabled() {
+    fn wechat_terminal_uses_live_probable_mode_without_confirmation() {
         let s = snap(ActiveIme::WeChatIme, Some(false), Some(true));
-        assert!(!s.auto_switch_enabled());
+        assert!(s.auto_switch_enabled());
         assert_eq!(
             s.observe_layer(),
             LayerObservation::Probable(TargetMode::ImeEnglish)
         );
+        assert_eq!(s.resolve_layer(None), Some(TargetMode::ImeEnglish));
         assert_eq!(
             plan_terminal_english(ActiveIme::WeChatIme, s.observe_layer(), None),
+            TerminalEnPlan::Skip
+        );
+        assert_eq!(
+            plan_terminal_english(
+                ActiveIme::WeChatIme,
+                LayerObservation::Confident(TargetMode::ImeEnglish),
+                None,
+            ),
             TerminalEnPlan::Defer
         );
     }

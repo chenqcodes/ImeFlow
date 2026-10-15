@@ -1,13 +1,23 @@
+// 窗口程序：开机自启动不会再弹出并留下控制台。从 cmd 启动时再接父控制台。
+#![windows_subsystem = "windows"]
+
 mod asset_pixels;
 mod assets;
-mod debug_ui;
 mod feedback;
 mod focus_gate;
 mod ime;
+mod instance;
 mod key_trace;
+mod logging;
+const BUILD_ID: &str = include_str!("../build-id.txt");
+mod highlight;
 mod mode;
 mod process;
+mod rule_manager;
+mod rule_panel;
 mod rules;
+mod settings_ui;
+mod status_observer;
 mod tray;
 mod ui_graphics;
 mod uia;
@@ -16,11 +26,10 @@ mod watcher;
 use feedback::{FeedbackBus, SwitchEvent};
 use ime::{classify_installed_imes, ActiveIme, ImeController};
 use mode::TargetMode;
-use rules::{resolve_rules_path, RuleEngine};
+use rules::{resolve_rules_path, RuleEngine, RuleStore};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing_subscriber::EnvFilter;
 use watcher::{AppWatcher, WatchEvent};
 use windows::Win32::Foundation::HWND;
 
@@ -37,15 +46,61 @@ pub(crate) fn mark_resync_after_enable() {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_ansi(false)
-        .with_target(false)
-        .init();
-
+    // 父进程已有控制台（cmd / probe）就接上，方便打印；资源管理器或开机启动没有父控制台，失败即无黑框。
+    unsafe {
+        let _ = windows::Win32::System::Console::AttachConsole(
+            windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
     let args: Vec<String> = std::env::args().collect();
+    let debug = args.iter().any(|a| a == "--debug");
+    if args.iter().any(|a| a == "--version") {
+        println!("{}", BUILD_ID.trim());
+        return;
+    }
+    let diagnostic = args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--check-assets"
+                | "--probe"
+                | "--probe-focus"
+                | "--probe-ime"
+                | "--probe-shift"
+                | "--verify-switch"
+        )
+    });
+    // Older running builds do not yet own the named mutex.
+    let _instance = if diagnostic {
+        None
+    } else {
+        if other_imeflow_running(std::process::id()) {
+            eprintln!(
+                "Another imeflow.exe is running. Exit it from the tray before starting this build."
+            );
+            std::process::exit(2);
+        }
+        match instance::InstanceLock::acquire() {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    };
+    let log_path = match logging::init(
+        debug,
+        if diagnostic {
+            logging::SessionKind::Diagnostic
+        } else {
+            logging::SessionKind::Daemon
+        },
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
     if args.iter().any(|a| a == "--check-assets") {
         // Validation-only entry: no WinEvent hooks, key injection, tray or statistics writes.
         if let Err(error) = assets::validate() {
@@ -60,6 +115,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--probe-focus") {
         run_probe_focus();
+        return;
+    }
+    if args.iter().any(|a| a == "--probe-ime") {
+        run_probe_ime();
         return;
     }
     if args.iter().any(|a| a == "--probe-shift") {
@@ -79,14 +138,17 @@ fn main() {
         TRACE_KEYS.store(true, Ordering::SeqCst);
     }
 
-    if other_imeflow_running(std::process::id()) {
-        tracing::error!("Another imeflow.exe is running. Stop it before testing this build.");
-        std::process::exit(2);
-    }
-    tracing::info!("ImeFlow starting build=m1.1-assets1 pid={}", std::process::id());
+    tracing::info!(
+        "ImeFlow starting build={} pid={} log={}",
+        BUILD_ID.trim(),
+        std::process::id(),
+        log_path.display()
+    );
     // UI assets and DPI are initialized before any input hooks or IME transactions.
     unsafe {
-        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     if let Err(error) = assets::get() {
@@ -102,17 +164,21 @@ fn main() {
     log_installed_imes();
 
     if TRACE_KEYS.load(Ordering::SeqCst) {
+        key_trace::pin_for_session();
         if let Err(e) = key_trace::start() {
             tracing::error!("key_trace start failed: {e}");
             std::process::exit(1);
         }
-        key_trace::pin_for_session();
     }
 
     let rules_path = resolve_rules_path();
-    let engine = match RuleEngine::load_from(&rules_path) {
+    let engine = match RuleStore::load(&rules_path) {
         Ok(e) => {
-            tracing::info!("loaded {} rules from {}", e.len(), rules_path.display());
+            tracing::info!(
+                "loaded {} rules from {}",
+                e.snapshot().len(),
+                e.path().display()
+            );
             Arc::new(e)
         }
         Err(e) => {
@@ -123,10 +189,8 @@ fn main() {
     };
 
     let bus = FeedbackBus::default();
-    debug_ui::init(bus.clone());
-    if let Err(e) = tray::install(bus.clone(), true) {
+    if let Err(e) = tray::install(bus.clone(), true, Arc::clone(&engine)) {
         key_trace::stop();
-        debug_ui::shutdown();
         tracing::error!("tray failed; app was not started: {e}");
         std::process::exit(1);
     }
@@ -139,26 +203,24 @@ fn main() {
     let last_key_hook = Arc::clone(&last_key);
 
     match AppWatcher::start(move |ev| {
-        on_watch(ev, &engine_hook, &bus_hook, &last_key_hook);
+        on_watch(ev, &engine_hook.snapshot(), &bus_hook, &last_key_hook);
     }) {
         Ok(_w) => {
             let fg = process::foreground_hwnd();
             if !fg.0.is_null() {
                 on_watch(
                     WatchEvent::Foreground(fg),
-                    &engine,
+                    &engine.snapshot(),
                     &bus,
                     &last_key,
                 );
             }
             tracing::info!("message loop running — tray: auto / status / autostart / logs / exit");
             AppWatcher::run_message_loop();
-            debug_ui::shutdown();
             tray::remove();
             key_trace::stop();
         }
         Err(e) => {
-            debug_ui::shutdown();
             tray::remove();
             key_trace::stop();
             tracing::error!("SetWinEventHook failed: {e}");
@@ -168,6 +230,7 @@ fn main() {
 }
 
 struct LastMatch {
+    wechat_settling: ime::planner::WeChatSettling,
     root: isize,
     gate: focus_gate::FocusGate<String, TargetMode>,
     next_apply: u64,
@@ -190,6 +253,7 @@ struct LastMatch {
 impl Default for LastMatch {
     fn default() -> Self {
         Self {
+            wechat_settling: Default::default(),
             root: 0,
             gate: focus_gate::FocusGate::new(Duration::from_millis(100)),
             next_apply: 0,
@@ -205,14 +269,39 @@ impl Default for LastMatch {
     }
 }
 
+impl LastMatch {
+    fn invalidate_after_error(&mut self, may_have_changed: bool) {
+        self.wechat_settling = Default::default();
+        self.expected_mode = None;
+        if may_have_changed {
+            // A cancelled transaction can already have sent Shift. Its previous baseline
+            // no longer authorizes Skip, manual-toggle inference or transition guards.
+            self.ime_layer = None;
+            self.block_chinese_until = None;
+            self.cursor_terminal_guard_until = None;
+            self.cursor_terminal_seen_at = None;
+            self.last_apply_at = None;
+        }
+    }
+}
+
 fn request_focus_confirmation(last: &parking_lot::Mutex<LastMatch>) {
     let schedule = {
         let mut state = last.lock();
-        if state.rechecks >= 8 { false }
-        else { state.rechecks += 1; true }
+        if state.rechecks >= 8 {
+            false
+        } else {
+            state.rechecks += 1;
+            true
+        }
     };
-    if schedule { AppWatcher::request_recheck(); }
-    else { tracing::warn!("focus/state confirmation budget exhausted; wait for the next real focus event"); }
+    if schedule {
+        AppWatcher::request_recheck();
+    } else {
+        tracing::warn!(
+            "focus/state confirmation budget exhausted; wait for the next real focus event"
+        );
+    }
 }
 
 fn focus_key(root: HWND, info: &uia::FocusInfo) -> Option<String> {
@@ -222,8 +311,13 @@ fn focus_key(root: HWND, info: &uia::FocusInfo) -> Option<String> {
     // owner_root is useful metadata but must not reject a same-process focus.
     let same_process = info.process_id != 0 && info.process_id == root_pid;
     let same_root = info.owner_root != 0 && info.owner_root == root.0 as isize;
-    if (!same_process && !same_root) || info.runtime_id.is_empty() { return None; }
-    Some(format!("{:x}:{}:{:?}", root.0 as usize, info.process_id, info.runtime_id))
+    if (!same_process && !same_root) || info.runtime_id.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{:x}:{}:{:?}",
+        root.0 as usize, info.process_id, info.runtime_id
+    ))
 }
 
 fn log_installed_imes() {
@@ -283,6 +377,62 @@ fn run_probe_shift() {
     println!("PROBE_SHIFT_DONE");
 }
 
+fn run_probe_ime() {
+    use ime::tsf::{format_clsid, read_global_compartments};
+
+    println!("=== ImeFlow --probe-ime (IMM vs TSF) ===");
+    println!("Focus the target control (e.g. browser address bar), wait 1s…");
+    std::thread::sleep(Duration::from_secs(1));
+
+    println!("\n--- installed zh TIP profiles ---");
+    for p in ime::tsf::enum_zh_profiles() {
+        println!(
+            "  [{:?}] clsid={} profile={}",
+            p.backend,
+            format_clsid(&p.clsid),
+            format_clsid(&p.guid_profile),
+        );
+    }
+    if let Some(active) = ime::tsf::active_keyboard_profile() {
+        println!(
+            "active TIP: [{:?}] clsid={}",
+            active.backend,
+            format_clsid(&active.clsid),
+        );
+    } else {
+        println!("active TIP: (none)");
+    }
+
+    let hwnd = process::foreground_hwnd();
+    let root = process::root_hwnd(hwnd);
+    let exe = process::hwnd_exe_name(root).unwrap_or_else(|| "?".into());
+    let snap = ImeController::read(root);
+    let tsf = read_global_compartments();
+    let imm_open = snap.open;
+    let imm_native = snap.conversion_native;
+
+    println!("\n--- foreground ---");
+    println!("exe:       {exe}");
+    println!("IMM:       {}", snap.describe());
+    println!("IMM raw:   open={:?} native={:?}", imm_open, imm_native);
+    println!("TSF global (diagnostic only): {}", tsf.describe());
+    println!("observe:   {:?}", snap.observe_layer());
+
+    if let Some(info) = uia::inspect_focused() {
+        println!("UIA kind:  {}", info.kind.as_str());
+        println!("UIA name:  {}", info.name);
+        if let Ok(engine) = RuleEngine::load_from(&resolve_rules_path()) {
+            let mode = engine.match_focus(&exe, &info, info.kind);
+            println!("rule →    {mode:?}");
+        }
+    }
+
+    println!(
+        "note: TSF global values do not verify the target input context; no MATCH/MISMATCH verdict"
+    );
+    println!("PROBE_IME_OK");
+}
+
 fn run_probe_focus() {
     println!("=== ImeFlow probe-focus ===");
     println!("Focus a Codex text box / terminal, wait 1s…");
@@ -303,7 +453,7 @@ fn run_probe_focus() {
             println!("password:    {}", info.is_password);
             println!("breadcrumb:  {}", info.breadcrumb);
             if let Ok(engine) = RuleEngine::load_from(&resolve_rules_path()) {
-                let mode = engine.match_target(&exe, Some(info.kind));
+                let mode = engine.match_focus(&exe, &info, info.kind);
                 println!("rule → {mode:?}");
             }
             println!("PROBE_FOCUS_OK");
@@ -329,22 +479,22 @@ fn run_probe() {
         Ok(e) => {
             println!("rules: {} from {}", e.len(), path.display());
             assert_eq!(
-                e.match_process("Code.exe"),
+                e.match_target("Code.exe", Some(uia::ControlKind::CodeEditor)),
                 TargetMode::ImeEnglish,
                 "Code.exe rule"
             );
             assert_eq!(
-                e.match_process("WeChat.exe"),
+                e.match_target("WeChat.exe", Some(uia::ControlKind::Other)),
                 TargetMode::NativeChinese,
                 "WeChat.exe rule"
             );
             assert_eq!(
-                e.match_process("Weixin.exe"),
+                e.match_target("Weixin.exe", Some(uia::ControlKind::Other)),
                 TargetMode::NativeChinese,
                 "Weixin.exe rule"
             );
             assert_eq!(
-                e.match_process("notepad.exe"),
+                e.match_target("notepad.exe", Some(uia::ControlKind::Other)),
                 TargetMode::NativeChinese,
                 "notepad.exe rule"
             );
@@ -381,8 +531,7 @@ fn run_probe() {
                 // Conversion readback often fails on explorer; tip switch still counts for V0.
                 let tip_ok = after.layout.backend != ActiveIme::Unknown
                     && after.layout.backend != ActiveIme::LayoutEnglish;
-                if tip_ok && matches!(target, TargetMode::NativeChinese | TargetMode::ImeEnglish)
-                {
+                if tip_ok && matches!(target, TargetMode::NativeChinese | TargetMode::ImeEnglish) {
                     println!("PROBE_OK_TIP_ONLY (conversion readback weak on this hwnd)");
                 } else {
                     println!("PROBE_FAIL");
@@ -437,14 +586,14 @@ fn run_verify_switch() {
 
     let ide_hwnd = process::find_hwnd_by_exe(ide_exe).unwrap();
     let chat_hwnd = process::find_hwnd_by_exe(chat_exe).unwrap();
-    let ide_mode = engine.match_process(ide_exe);
-    let chat_mode = engine.match_process(chat_exe);
+    let ide_mode = engine.match_target(ide_exe, Some(uia::ControlKind::CodeEditor));
+    let chat_mode = engine.match_target(chat_exe, Some(uia::ControlKind::Other));
     println!("IDE  {ide_exe} → {ide_mode:?}");
     println!("Chat {chat_exe} → {chat_mode:?}");
     if let Some(alt) = alt_chinese {
         println!(
             "AltChinese {alt} → {:?}",
-            engine.match_process(alt)
+            engine.match_target(alt, Some(uia::ControlKind::Edit))
         );
     }
 
@@ -462,8 +611,8 @@ fn run_verify_switch() {
     let mut ide_fails = 0u32;
     let mut weixin_fails = 0u32;
     let mut alt_fails = 0u32;
-    let alt_hwnd = alt_chinese.and_then(|exe| process::find_hwnd_by_exe(exe));
-    let alt_mode = alt_chinese.map(|exe| engine.match_process(exe));
+    let alt_hwnd = alt_chinese.and_then(process::find_hwnd_by_exe);
+    let alt_mode = alt_chinese.map(|exe| engine.match_target(exe, Some(uia::ControlKind::Edit)));
 
     for round in 1..=3 {
         println!("-- round {round} --");
@@ -486,7 +635,12 @@ fn run_verify_switch() {
             }
             let snap = ImeController::read(fg);
             let ok = matches_already(&snap, chat_mode);
-            println!("  weixin ime={} expect={:?} ok={}", snap.describe(), chat_mode, ok);
+            println!(
+                "  weixin ime={} expect={:?} ok={}",
+                snap.describe(),
+                chat_mode,
+                ok
+            );
             if !ok {
                 weixin_fails += 1;
             }
@@ -510,7 +664,12 @@ fn run_verify_switch() {
             }
             let snap = ImeController::read(fg);
             let ok = matches_already(&snap, ide_mode);
-            println!("  ide ime={} expect={:?} ok={}", snap.describe(), ide_mode, ok);
+            println!(
+                "  ide ime={} expect={:?} ok={}",
+                snap.describe(),
+                ide_mode,
+                ok
+            );
             if !ok {
                 ide_fails += 1;
             }
@@ -552,31 +711,13 @@ fn run_verify_switch() {
     }
 
     println!("VERIFY_FAIL ide_fails={ide_fails} weixin_fails={weixin_fails} alt_fails={alt_fails}");
-    if ide_ok && alt_ok && alt_chinese.is_some() {
+    if let Some(alt) = alt_chinese.filter(|_| ide_ok && alt_ok) {
         println!(
             "NOTE: IDE + {} NativeChinese works (WeChat IME path); Weixin shell still blocked",
-            alt_chinese.unwrap()
+            alt
         );
     }
     std::process::exit(2);
-}
-
-fn apply_with_transition_hint(
-    root: HWND,
-    target: TargetMode,
-    kind: Option<uia::ControlKind>,
-    resolved_layer: Option<TargetMode>,
-    observation: ime::LayerObservation,
-) -> Result<ime::ImeSnapshot, String> {
-    if kind == Some(uia::ControlKind::Terminal) && target == TargetMode::ImeEnglish {
-        // 调用方已用 plan_terminal_english 判定 Shift；此处只执行 quiet+一键。
-        tracing::info!(
-            ?observation,
-            ?resolved_layer,
-            "terminal: focus-quiet then one Shift → expected 英"
-        );
-    }
-    ImeController::apply_for(root, target, kind)
 }
 
 fn on_watch(
@@ -585,7 +726,9 @@ fn on_watch(
     bus: &FeedbackBus,
     last: &parking_lot::Mutex<LastMatch>,
 ) {
-    let event_hwnd = match ev { WatchEvent::Foreground(h) | WatchEvent::Focus(h) => h };
+    let event_hwnd = match ev {
+        WatchEvent::Foreground(h) | WatchEvent::Focus(h) => h,
+    };
     // Events are wakeups, not authoritative descriptions of the current focus.
     let fg = process::foreground_hwnd();
     let root = process::root_hwnd(fg);
@@ -605,6 +748,7 @@ fn on_watch(
         }
         let changed = state.root != root.0 as isize;
         if changed {
+            state.wechat_settling = Default::default();
             state.root = root.0 as isize;
             state.gate.reset();
             state.rechecks = 0;
@@ -624,7 +768,6 @@ fn on_watch(
     if manual_chinese {
         bus.set_last_mode(TargetMode::NativeChinese);
         tray::refresh();
-        debug_ui::request_refresh();
         tracing::info!("user override: clean Shift tap → ime_layer 中");
     }
     // If no manual tap was consumed, leaving the root disarms the lazy listener so a Shift in
@@ -633,24 +776,33 @@ fn on_watch(
         key_trace::clear_user_override();
     }
 
-    if fg.0.is_null() { return; }
-    let Some(exe) = process::hwnd_exe_name(root) else { return };
-    if exe.eq_ignore_ascii_case("imeflow.exe") { return; }
+    if fg.0.is_null() {
+        return;
+    }
+    let Some(exe) = process::hwnd_exe_name(root) else {
+        return;
+    };
+    if exe.eq_ignore_ascii_case("imeflow.exe") {
+        return;
+    }
     if root_changed {
         // Even when UIA is unavailable, never display the previous application's mode as current.
         bus.begin_focus(&format!("root:{:x}", root.0 as usize), &exe);
         tray::refresh();
-        debug_ui::request_refresh();
     }
-    if !tray::enabled() || bus.in_override_cooldown() { return; }
+    if !tray::enabled() || bus.in_override_cooldown() || rule_panel::is_capturing() {
+        last.lock().wechat_settling = Default::default();
+        return;
+    }
     // 暂停期间 gate 仍可能记着 AlreadyHandled；恢复后必须重看当前焦点。
     if RESYNC_AFTER_ENABLE.swap(false, Ordering::SeqCst) {
         let mut state = last.lock();
         state.gate.reset();
+        state.wechat_settling = Default::default();
         state.expected_mode = None;
         state.rechecks = 0;
         state.last_apply_at = None;
-        tracing::info!("tray: resync after auto re-enabled");
+        tracing::info!("tray: resync after auto re-enabled or rules reloaded");
     }
 
     let native_focus = match process::InputTarget::capture(root) {
@@ -677,8 +829,18 @@ fn on_watch(
         return;
     }
 
+    if focus.is_navigation_control() {
+        last.lock().gate.complete(base_key.clone());
+        bus.begin_focus(&base_key, &exe);
+        bus.record_passthrough(&exe);
+        tray::refresh();
+        tracing::debug!(%exe, "navigation control; no IME write or process-rule fallback");
+        return;
+    }
+
     let now = Instant::now();
-    let cursor_like = exe.eq_ignore_ascii_case("Cursor.exe") || exe.eq_ignore_ascii_case("Code.exe");
+    let cursor_like =
+        exe.eq_ignore_ascii_case("Cursor.exe") || exe.eq_ignore_ascii_case("Code.exe");
     let raw_kind = focus.kind;
     let mut effective_kind = raw_kind;
     let mut sticky_terminal = false;
@@ -690,10 +852,12 @@ fn on_watch(
         } else if raw_kind == uia::ControlKind::Edit && !focus.looks_explicit_chat_input() {
             let terminalish = {
                 let state = last.lock();
-                let post_apply_guard = state.cursor_terminal_guard_until
+                let post_apply_guard = state
+                    .cursor_terminal_guard_until
                     .map(|until| now < until)
                     .unwrap_or(false);
-                let pre_apply_handoff = state.cursor_terminal_seen_at
+                let pre_apply_handoff = state
+                    .cursor_terminal_seen_at
                     .map(|since| now.saturating_duration_since(since) < Duration::from_millis(1200))
                     .unwrap_or(false);
                 post_apply_guard || pre_apply_handoff
@@ -704,7 +868,7 @@ fn on_watch(
                 // logical terminal scope so an internal focus handoff cannot request Chinese.
                 effective_kind = uia::ControlKind::Terminal;
                 sticky_terminal = true;
-                tracing::info!(%exe, control = %focus.log_summary(),
+                tracing::debug!(%exe, control = %focus.log_summary(),
                     "cursor terminal handoff: transient Edit kept as terminal");
             } else {
                 last.lock().cursor_terminal_seen_at = None;
@@ -720,7 +884,9 @@ fn on_watch(
         if effective_kind == uia::ControlKind::Terminal {
             // Only wait for xterm's own focus handoff. Cross-app state is no longer inferred
             // from the previous app, so an extra foreground delay is unnecessary.
-            let xterm_stable = last.lock().cursor_terminal_seen_at
+            let xterm_stable = last
+                .lock()
+                .cursor_terminal_seen_at
                 .map(|since| now.saturating_duration_since(since) >= Duration::from_millis(360))
                 .unwrap_or(false);
             if !xterm_stable {
@@ -734,12 +900,15 @@ fn on_watch(
     let key = if cursor_like && effective_kind == uia::ControlKind::Terminal {
         // One logical scope for xterm's native surface + helper textarea. RuntimeId churn inside
         // this scope must not create a second, opposite IME transaction.
-        format!("{:x}:{}:integrated-terminal", root.0 as usize, focus.process_id)
+        format!(
+            "{:x}:{}:integrated-terminal",
+            root.0 as usize, focus.process_id
+        )
     } else {
         base_key
     };
     let kind = Some(effective_kind);
-    let target = engine.match_target(&exe, kind);
+    let target = engine.match_focus(&exe, &focus, effective_kind);
     let control_label = if sticky_terminal {
         format!("{} [raw=edit, effective=terminal]", focus.log_summary())
     } else {
@@ -747,7 +916,6 @@ fn on_watch(
     };
     // Display follows this logical region, not the last historical successful action.
     if bus.begin_focus(&key, &format!("{exe}/{}", effective_kind.as_str())) {
-        debug_ui::request_refresh();
         tray::refresh();
     }
     let decision = last.lock().gate.observe(key.clone(), target, now);
@@ -760,9 +928,10 @@ fn on_watch(
         }
         focus_gate::Decision::AlreadyHandled => {
             // Includes manual Shift changes in this same logical input element.
+            tracing::debug!(%exe, %key, ?target, "same logical input already handled; preserve manual mode");
             return;
         }
-        focus_gate::Decision::Ready => {},
+        focus_gate::Decision::Ready => {}
     }
 
     // Terminal focus hops: block transient 中 after terminal→英; Cursor gets an extra 900ms guard.
@@ -803,6 +972,12 @@ fn on_watch(
         }
     }
 
+    if target == TargetMode::Passthrough {
+        last.lock().gate.complete(key.clone());
+        bus.record_passthrough(&exe);
+        tray::refresh();
+        return;
+    }
     if ime::modifiers_down() {
         tracing::debug!(%exe, "modifier held; defer without injecting keys");
         request_focus_confirmation(last);
@@ -817,12 +992,18 @@ fn on_watch(
         last.lock().gate.complete(key.clone());
         bus.record_passthrough(&exe);
         tray::refresh();
-        debug_ui::set_extra(|e| {
-            e.foreground = exe.clone();
-            e.control = control_label.clone();
-            e.snapshot = snap.describe();
-            e.last_action = format!("{exe}: skip auto-switch ({})", snap.backend_label());
-        });
+        return;
+    }
+    if !last
+        .lock()
+        .wechat_settling
+        .ready(&key, generation, &snap, Instant::now())
+    {
+        tracing::debug!(%exe, generation, open = ?snap.open, native = ?snap.conversion_native,
+            "wechat mode settling; no IME write");
+        bus.record_deferred(&format!("{exe}/{}", effective_kind.as_str()), target);
+        tray::refresh();
+        request_focus_confirmation(last);
         return;
     }
     let ime_layer = last.lock().ime_layer;
@@ -830,83 +1011,68 @@ fn on_watch(
     let resolved_layer = snap.resolve_layer(ime_layer);
     // Cross-process queries can yield messages. Revalidate the logical element too.
     let latest = uia::inspect_focused();
-    let still_same = latest.as_ref().map(|f| {
-        if cursor_like && effective_kind == uia::ControlKind::Terminal {
-            // During Cursor's xterm handoff, RuntimeId may change from terminal surface to a
-            // helper Edit. Accept that as the same logical terminal unless it clearly looks
-            // like a real chat/prompt input.
-            focus_key(root, f).is_some()
-                && (f.kind == uia::ControlKind::Terminal
-                    || (f.kind == uia::ControlKind::Edit && !f.looks_explicit_chat_input()))
-        } else {
-            focus_key(root, f).as_ref() == Some(&key)
-                && engine.match_target(&exe, Some(f.kind)) == target
-        }
-    }).unwrap_or(false);
-    if !still_same || native_focus.ensure_current().is_err() || AppWatcher::generation() != generation {
+    let still_same = latest
+        .as_ref()
+        .map(|f| {
+            if cursor_like && effective_kind == uia::ControlKind::Terminal {
+                // During Cursor's xterm handoff, RuntimeId may change from terminal surface to a
+                // helper Edit. Accept that as the same logical terminal unless it clearly looks
+                // like a real chat/prompt input.
+                focus_key(root, f).is_some()
+                    && (f.kind == uia::ControlKind::Terminal
+                        || (f.kind == uia::ControlKind::Edit && !f.looks_explicit_chat_input()))
+                    && engine.match_focus(&exe, f, effective_kind) == target
+            } else {
+                focus_key(root, f).as_ref() == Some(&key)
+                    && engine.match_focus(&exe, f, f.kind) == target
+            }
+        })
+        .unwrap_or(false);
+    if !still_same
+        || native_focus.ensure_current().is_err()
+        || AppWatcher::generation() != generation
+    {
         tracing::debug!(%exe, "stale focus decision cancelled before apply");
         request_focus_confirmation(last);
         return;
     }
 
-    let terminal_plan = if effective_kind == uia::ControlKind::Terminal
-        && target == TargetMode::ImeEnglish
-    {
-        Some(ime::plan_terminal_english(
-            snap.layout.backend,
-            observation,
-            ime_layer,
-        ))
-    } else {
-        None
-    };
-    match terminal_plan {
-        Some(ime::TerminalEnPlan::Defer) => {
-            tracing::info!(
-                %exe,
-                generation,
-                ?observation,
-                ?ime_layer,
-                "terminal: Defer (insufficient mode evidence; not a focus error)"
-            );
-            bus.record_deferred(&format!("{exe}/terminal"), target);
+    match ime::planner::plan(&snap, target, effective_kind, ime_layer) {
+        ime::planner::SwitchPlan::Defer => {
+            tracing::info!(%exe, generation, ?observation, ?ime_layer, "Defer (insufficient mode evidence; no toggle from memory)");
+            bus.record_deferred(&format!("{exe}/{}", effective_kind.as_str()), target);
             tray::refresh();
-            debug_ui::set_extra(|e| {
-                e.foreground = exe.clone();
-                e.control = control_label.clone();
-                e.snapshot = snap.describe();
-                e.last_action = format!("{exe}: terminal Defer");
-            });
             request_focus_confirmation(last);
             return;
         }
-        Some(ime::TerminalEnPlan::Skip) => {
-            let apply_id = {
-                let mut state = last.lock();
-                state.gate.complete(key.clone());
-                state.expected_mode = Some(target);
-                if let ime::LayerObservation::Confident(observed_mode) = observation {
-                    // An already-active ENG layout is not the Chinese IME's English layer.
-                    state.ime_layer = Some(observed_mode);
-                }
-                state.next_apply += 1;
-                state.next_apply
-            };
-            let _ = apply_id;
-            tracing::info!(?observation, "terminal: Skip (Confident 英)");
-            bus.record_skip_same(&format!("{exe}/terminal"), target, true);
+        ime::planner::SwitchPlan::Skip { mode, confirmed } => {
+            let mut state = last.lock();
+            state.gate.complete(key.clone());
+            state.expected_mode = Some(target);
+            if let ime::LayerObservation::Confident(observed) = observation {
+                state.ime_layer = Some(observed);
+            }
+            drop(state);
+            tracing::info!(
+                %exe,
+                generation,
+                %key,
+                ?target,
+                ?observation,
+                ?ime_layer,
+                confirmed,
+                "resolved layer matches; no write"
+            );
+            bus.record_skip_same(
+                &format!("{exe}/{}", effective_kind.as_str()),
+                mode,
+                confirmed,
+            );
             tray::refresh();
-            debug_ui::set_extra(|e| {
-                e.foreground = exe.clone();
-                e.control = control_label.clone();
-                e.snapshot = snap.describe();
-                e.last_action = format!("{exe}: terminal already 英");
-            });
             return;
         }
-        Some(ime::TerminalEnPlan::Shift) | None => {}
+        ime::planner::SwitchPlan::Apply => {}
     }
-
     // Consume this focus epoch before any IME API. Queued self-events cannot reapply it.
     let apply_id = {
         let mut state = last.lock();
@@ -917,50 +1083,7 @@ fn on_watch(
     let span = tracing::info_span!("ime_apply", apply_id, generation, exe = %exe,
         target = %target, scope = %key);
     let _entered = span.enter();
-    debug_ui::set_extra(|e| {
-        e.foreground = exe.clone();
-        e.control = control_label.clone();
-        e.snapshot = snap.describe();
-        e.enabled = true;
-    });
-    if target == TargetMode::Passthrough {
-        tracing::info!(?ime_layer, ?observation, "passthrough; no writes; ime_layer kept");
-        bus.record_passthrough(&exe);
-        tray::refresh();
-        debug_ui::set_extra(|e| e.last_action = format!("{exe}/{control_label}: passthrough"));
-        return;
-    }
-    // Resolved live/memory layer already matches target → no write.
-    // terminal→英 已由 plan_terminal_english 处理。
-    if !(effective_kind == uia::ControlKind::Terminal && target == TargetMode::ImeEnglish)
-        && matches!(target, TargetMode::NativeChinese | TargetMode::ImeEnglish)
-        && resolved_layer == Some(target)
-    {
-        tracing::info!(
-            ?target,
-            ?observation,
-            ?resolved_layer,
-            "resolved layer already matches; no write"
-        );
-        last.lock().expected_mode = Some(target);
-        if matches!(observation, ime::LayerObservation::Confident(_)) {
-            last.lock().ime_layer = Some(target);
-        }
-        let confident = matches!(observation, ime::LayerObservation::Confident(m) if m == target);
-        bus.record_skip_same(&format!("{exe}/{}", effective_kind.as_str()), target, confident);
-        tray::refresh();
-        debug_ui::set_extra(|e| e.last_action = format!("{exe}: resolved already {target}"));
-        return;
-    }
-    // Only a real keyboard-layout match is trusted enough to skip a write.
-    if target == TargetMode::LayoutEnglish && matches_already(&snap, target) {
-        tracing::info!("layout report matches; no write");
-        last.lock().expected_mode = Some(target);
-        bus.record_skip_same(&format!("{exe}/{}", effective_kind.as_str()), target, true);
-        tray::refresh();
-        debug_ui::set_extra(|e| e.last_action = format!("{exe}: layout already {target}"));
-        return;
-    }
+
     let before = snap.describe();
     let kind_s = effective_kind.as_str();
     tracing::info!(
@@ -972,13 +1095,25 @@ fn on_watch(
         control = %control_label,
         "apply begin"
     );
-    let will_terminal_shift = effective_kind == uia::ControlKind::Terminal
-        && target == TargetMode::ImeEnglish;
+    let will_terminal_shift =
+        effective_kind == uia::ControlKind::Terminal && target == TargetMode::ImeEnglish;
     if will_terminal_shift && TRACE_KEYS.load(Ordering::SeqCst) {
         key_trace::arm_shift_window(apply_id, Duration::from_millis(500));
     }
-    match apply_with_transition_hint(root, target, kind, resolved_layer, observation) {
-        Ok(after_snap) => {
+    bus.record_requested(&format!("{exe}/{kind_s}"), target);
+    match ImeController::apply_for_focus(root, target, kind, &focus) {
+        Ok(outcome) if !outcome.applied => {
+            if will_terminal_shift && TRACE_KEYS.load(Ordering::SeqCst) {
+                key_trace::cancel_shift_window();
+            }
+            // A context may synchronize while execution waits. A no-op is not an action
+            // and must not arm terminal guards, manual-toggle inference or action memory.
+            bus.record_skip_same(&format!("{exe}/{kind_s}"), target, false);
+            tracing::info!(after = %outcome.snapshot.describe(), "apply skipped at final mode check; no write");
+            tray::refresh();
+        }
+        Ok(outcome) => {
+            let after_snap = outcome.snapshot;
             let after_obs = after_snap.observe_layer();
             {
                 let mut state = last.lock();
@@ -1001,7 +1136,8 @@ fn on_watch(
                             || resolved_layer
                                 .map(|r| r.opposite_ime_layer(target))
                                 .unwrap_or(false)
-                            || (target == TargetMode::NativeChinese && resolved_layer.is_none()) =>
+                            || (target == TargetMode::NativeChinese
+                                && resolved_layer.is_none()) =>
                     {
                         state.ime_layer = Some(target);
                     }
@@ -1040,9 +1176,6 @@ fn on_watch(
             let focus_hwnd = process::InputTarget::capture(root)
                 .map(|t| format!("{:x}", t.focus as usize))
                 .unwrap_or_else(|_| "?".into());
-            let note = format!(
-                "apply={apply_id} {kind_s} imm_report_matches={imm_matches} confirmed={confirmed} focus={focus_hwnd}"
-            );
             tracing::info!(
                 imm_after = %after,
                 imm_report_matches = imm_matches,
@@ -1060,24 +1193,28 @@ fn on_watch(
                 confirmed,
             });
             tray::refresh();
-            debug_ui::set_extra(|e| {
-                e.snapshot = after;
-                e.last_action = format!("{exe}/{kind_s} -> {target} | {note}");
-            });
-            debug_ui::notify_switch(confirmed);
         }
         Err(err) => {
             {
                 let mut state = last.lock();
-                state.expected_mode = None;
+                state.invalidate_after_error(err.may_have_changed);
                 if cursor_like && effective_kind == uia::ControlKind::Terminal {
                     state.cursor_terminal_guard_until = None;
                 }
             }
+            if err.may_have_changed {
+                key_trace::clear_user_override();
+            }
             if will_terminal_shift && TRACE_KEYS.load(Ordering::SeqCst) {
                 key_trace::cancel_shift_window();
             }
-            tracing::warn!(%err, "apply stopped; no fallback layout or retry");
+            if !err.may_have_changed {
+                last.lock().gate.retry_without_effect(&key);
+                request_focus_confirmation(last);
+            }
+            tracing::warn!(%err, may_have_changed = err.may_have_changed,
+                memory_invalidated = err.may_have_changed,
+                "apply stopped; retry only allowed before any write");
             bus.record_switch(SwitchEvent {
                 process: format!("{exe}/{kind_s}"),
                 target,
@@ -1085,7 +1222,6 @@ fn on_watch(
                 confirmed: false,
             });
             tray::refresh();
-            debug_ui::set_extra(|e| e.last_action = format!("{exe}/{kind_s} STOP: {err}"));
         }
     }
 }
@@ -1114,11 +1250,11 @@ fn finish_terminal_shift_trace(apply_id: u64) {
 
 fn other_imeflow_running(self_pid: u32) -> bool {
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::K32EnumProcesses;
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows::Win32::System::ProcessStatus::K32EnumProcesses;
 
     let mut pids = vec![0u32; 1024];
     let mut bytes = 0u32;
@@ -1163,22 +1299,10 @@ fn other_imeflow_running(self_pid: u32) -> bool {
 }
 
 fn matches_already(snap: &ime::ImeSnapshot, target: TargetMode) -> bool {
-    match target {
-        TargetMode::LayoutEnglish => snap.layout.backend == ActiveIme::LayoutEnglish,
-        TargetMode::NativeChinese => {
-            matches!(
-                snap.layout.backend,
-                ActiveIme::WeChatIme | ActiveIme::MsPinyin | ActiveIme::OtherChinese
-            ) && snap.conversion_native == Some(true)
-        }
-        TargetMode::ImeEnglish => {
-            matches!(
-                snap.layout.backend,
-                ActiveIme::WeChatIme | ActiveIme::MsPinyin | ActiveIme::OtherChinese
-            ) && snap.conversion_native == Some(false)
-        }
-        TargetMode::Passthrough => true,
-    }
+    target == TargetMode::Passthrough
+        || matches!(snap.observe_layer(),
+            ime::LayerObservation::Confident(mode) | ime::LayerObservation::Probable(mode)
+            if mode == target)
 }
 
 fn ctrlc_stub() {
@@ -1195,5 +1319,47 @@ fn ctrlc_stub() {
     }
     unsafe {
         let _ = SetConsoleCtrlHandler(Some(handler), true);
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_shift_cannot_authorize_a_later_chinese_skip() {
+        let snapshot = ime::ImeSnapshot {
+            layout: ime::LayoutInfo {
+                lang_id: 0x0804,
+                backend: ime::ActiveIme::WeChatIme,
+            },
+            conversion_native: Some(false),
+            open: Some(true),
+        };
+        let mut state = LastMatch {
+            ime_layer: Some(TargetMode::NativeChinese),
+            ..Default::default()
+        };
+        assert_eq!(
+            ime::planner::plan(
+                &snapshot,
+                TargetMode::NativeChinese,
+                uia::ControlKind::Edit,
+                state.ime_layer
+            ),
+            ime::planner::SwitchPlan::Apply
+        );
+        state.invalidate_after_error(false);
+        assert_eq!(state.ime_layer, Some(TargetMode::NativeChinese));
+        state.invalidate_after_error(true);
+        assert_eq!(
+            ime::planner::plan(
+                &snapshot,
+                TargetMode::NativeChinese,
+                uia::ControlKind::Edit,
+                state.ime_layer
+            ),
+            ime::planner::SwitchPlan::Apply
+        );
     }
 }

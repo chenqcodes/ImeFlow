@@ -1,4 +1,5 @@
 use super::tsf;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -9,7 +10,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, PostMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
     WM_INPUTLANGCHANGEREQUEST,
 };
-use windows::core::PCWSTR;
 
 const LANG_EN_US: u16 = 0x0409;
 const LANG_ZH_CN: u16 = 0x0804;
@@ -111,7 +111,11 @@ fn with_attached_input<T>(hwnd: HWND, f: impl FnOnce() -> T) -> T {
     result
 }
 
-fn post_layout_change(hwnd: HWND, hkl: HKL) {
+fn post_layout_change(
+    hwnd: HWND,
+    hkl: HKL,
+    transaction: &super::transaction::Transaction,
+) -> Result<(), String> {
     // Also nudge focus child + Chromium render host (terminals / Electron).
     let mut targets = vec![hwnd];
     if let Some(focus) = focus_hwnd_of(hwnd) {
@@ -124,6 +128,7 @@ fn post_layout_change(hwnd: HWND, hkl: HKL) {
     }
 
     for target in targets {
+        transaction.before_write()?;
         with_attached_input(target, || unsafe {
             // Do NOT KLF_SETFORPROCESS — that only changes ImeFlow itself.
             let _ = ActivateKeyboardLayout(hkl, Default::default());
@@ -145,6 +150,7 @@ fn post_layout_change(hwnd: HWND, hkl: HKL) {
             );
         });
     }
+    Ok(())
 }
 
 fn focus_hwnd_of(hwnd: HWND) -> Option<HWND> {
@@ -202,11 +208,15 @@ fn chrome_child(hwnd: HWND) -> Option<HWND> {
     }
 }
 
-pub fn activate_english_layout(hwnd: HWND) -> Result<(), String> {
+pub fn activate_english_layout(
+    hwnd: HWND,
+    transaction: &super::transaction::Transaction,
+) -> Result<(), String> {
+    transaction.before_write()?;
     let hkl = load_hkl("00000409").map_err(|e| format!("LoadKeyboardLayout en-US: {e}"))?;
     // Session TSF profile first (when en-US is installed), then per-hwnd HKL request.
     let _ = tsf::activate_english_via_tsf();
-    post_layout_change(hwnd, hkl);
+    post_layout_change(hwnd, hkl, transaction)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     // Verify against target thread HKL — not our process.
     let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
@@ -216,12 +226,16 @@ pub fn activate_english_layout(hwnd: HWND) -> Result<(), String> {
         return Ok(());
     }
     // One more push
-    post_layout_change(hwnd, hkl);
+    post_layout_change(hwnd, hkl, transaction)?;
     Ok(())
 }
 
-pub fn activate_chinese_ime(hwnd: HWND) -> Result<(), String> {
+pub fn activate_chinese_ime(
+    hwnd: HWND,
+    transaction: &super::transaction::Transaction,
+) -> Result<(), String> {
     // Core prefers Microsoft Pinyin; WeChat is not an auto-switch target.
+    transaction.before_write()?;
     match tsf::activate_preferred_chinese(false) {
         Ok(tip) => {
             tracing::info!("TSF activated {:?}", tip.backend);
@@ -247,10 +261,13 @@ pub fn activate_chinese_ime(hwnd: HWND) -> Result<(), String> {
         }
     }
 
-    let hkl = zh
-        .or_else(|| load_hkl("00000804").ok())
-        .ok_or_else(|| "no Chinese layout found".to_string())?;
-    post_layout_change(hwnd, hkl);
+    let hkl = if let Some(hkl) = zh {
+        hkl
+    } else {
+        transaction.before_write()?;
+        load_hkl("00000804").map_err(|e| format!("no Chinese layout found: {e}"))?
+    };
+    post_layout_change(hwnd, hkl, transaction)?;
     Ok(())
 }
 

@@ -6,8 +6,11 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
+
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_InputProcessorProfiles, ITfInputProcessorProfileMgr, GUID_TFCAT_TIP_KEYBOARD,
+    CLSID_TF_InputProcessorProfiles, CLSID_TF_ThreadMgr, ITfCompartment, ITfCompartmentMgr,
+    ITfInputProcessorProfileMgr, ITfThreadMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+    GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE,
     TF_INPUTPROCESSORPROFILE, TF_IPPMF_ENABLEPROFILE, TF_IPPMF_FORSESSION,
     TF_PROFILETYPE_INPUTPROCESSOR,
 };
@@ -29,9 +32,7 @@ pub fn ensure_com() {
 
 fn profile_mgr() -> windows::core::Result<ITfInputProcessorProfileMgr> {
     ensure_com();
-    unsafe {
-        CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
-    }
+    unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }
 }
 
 #[derive(Debug, Clone)]
@@ -174,14 +175,14 @@ pub fn activate_preferred_chinese(prefer_wechat: bool) -> Result<TipProfile, Str
 pub fn activate_english_via_tsf() -> Result<(), String> {
     let mgr = profile_mgr().map_err(|e| format!("CoCreate profile mgr: {e}"))?;
     // Enum all profiles for en-US (0x0409)
-    let enumerator = unsafe { mgr.EnumProfiles(0x0409) }
-        .map_err(|e| format!("EnumProfiles en-US: {e}"))?;
+    let enumerator =
+        unsafe { mgr.EnumProfiles(0x0409) }.map_err(|e| format!("EnumProfiles en-US: {e}"))?;
 
-    loop {
+    {
         let mut buf = [TF_INPUTPROCESSORPROFILE::default(); 1];
         let mut fetched = 0u32;
         if unsafe { enumerator.Next(&mut buf, &mut fetched) }.is_err() || fetched == 0 {
-            break;
+            return Err("no en-US input profile installed".into());
         }
         let p = buf[0];
         unsafe {
@@ -195,7 +196,100 @@ pub fn activate_english_via_tsf() -> Result<(), String> {
             )
             .map_err(|e| format!("ActivateProfile en: {e}"))?;
         }
-        return Ok(());
+        Ok(())
     }
-    Err("no en-US input profile installed".into())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompartmentSnapshot {
+    pub open: Option<bool>,
+    pub conversion_raw: Option<u32>,
+    pub native: Option<bool>,
+    pub error: Option<String>,
+}
+
+impl CompartmentSnapshot {
+    pub fn describe(&self) -> String {
+        match (self.open, self.native, self.conversion_raw) {
+            (Some(open), Some(native), Some(raw)) => {
+                format!("open={open} native={native} raw=0x{raw:x}")
+            }
+            _ => self.error.clone().unwrap_or_else(|| "unavailable".into()),
+        }
+    }
+}
+
+/// Session/global diagnostic signal; never evidence of the target application's input context.
+pub fn read_global_compartments() -> CompartmentSnapshot {
+    ensure_com();
+    unsafe {
+        let mgr: ITfThreadMgr =
+            match CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) {
+                Ok(m) => m,
+                Err(e) => {
+                    return CompartmentSnapshot {
+                        error: Some(format!("CoCreate ThreadMgr: {e}")),
+                        ..Default::default()
+                    };
+                }
+            };
+        let _ = mgr.Activate();
+        let compartment_mgr = match mgr.GetGlobalCompartment() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = mgr.Deactivate();
+                return CompartmentSnapshot {
+                    error: Some(format!("GetGlobalCompartment: {e}")),
+                    ..Default::default()
+                };
+            }
+        };
+        let open = compartment_bool(&compartment_mgr, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE);
+        let conversion_raw = compartment_u32(
+            &compartment_mgr,
+            &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+        );
+        let native = conversion_raw.map(|v| (v & TF_CONVERSIONMODE_NATIVE) != 0);
+        let _ = mgr.Deactivate();
+        CompartmentSnapshot {
+            open,
+            conversion_raw,
+            native,
+            error: None,
+        }
+    }
+}
+
+fn compartment_u32(mgr: &ITfCompartmentMgr, guid: &GUID) -> Option<u32> {
+    unsafe {
+        let comp: ITfCompartment = mgr.GetCompartment(guid).ok()?;
+        variant_u32(&comp.GetValue().ok()?)
+    }
+}
+
+fn compartment_bool(mgr: &ITfCompartmentMgr, guid: &GUID) -> Option<bool> {
+    compartment_u32(mgr, guid).map(|v| v != 0)
+}
+
+fn variant_u32(value: &windows::core::VARIANT) -> Option<u32> {
+    u32::try_from(value)
+        .ok()
+        .or_else(|| i32::try_from(value).ok().map(|v| v as u32))
+}
+
+pub fn format_clsid(clsid: &GUID) -> String {
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        clsid.data1,
+        clsid.data2,
+        clsid.data3,
+        clsid.data4[0],
+        clsid.data4[1],
+        clsid.data4[2],
+        clsid.data4[3],
+        clsid.data4[4],
+        clsid.data4[5],
+        clsid.data4[6],
+        clsid.data4[7],
+    )
 }

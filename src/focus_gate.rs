@@ -17,7 +17,11 @@ pub struct FocusGate<K, M> {
 
 impl<K: Clone + Eq, M: Copy + Eq> FocusGate<K, M> {
     pub fn new(quiet: Duration) -> Self {
-        Self { candidate: None, handled: None, quiet }
+        Self {
+            candidate: None,
+            handled: None,
+            quiet,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -50,6 +54,13 @@ impl<K: Clone + Eq, M: Copy + Eq> FocusGate<K, M> {
         self.handled = Some(key);
         self.candidate = None;
     }
+
+    /// Re-arm only when execution proves no key/write occurred. Start a new quiet interval.
+    pub fn retry_without_effect(&mut self, key: &K) {
+        if self.handled.as_ref() == Some(key) {
+            self.reset();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -57,14 +68,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pre_write_failure_must_settle_again_but_cannot_reset_another_scope() {
+        let t = Instant::now();
+        let mut gate = FocusGate::new(Duration::from_millis(100));
+        gate.complete("terminal");
+        gate.retry_without_effect(&"other");
+        assert_eq!(gate.observe("terminal", "en", t), Decision::AlreadyHandled);
+        gate.retry_without_effect(&"terminal");
+        assert_eq!(gate.observe("terminal", "en", t), Decision::Confirm);
+        assert_eq!(
+            gate.observe("terminal", "en", t + Duration::from_millis(120)),
+            Decision::Ready
+        );
+    }
+
+    #[test]
     fn focus_storm_requires_stable_confirmation() {
         let t = Instant::now();
         let mut gate = FocusGate::new(Duration::from_millis(100));
         assert_eq!(gate.observe("terminal", "en", t), Decision::Confirm);
-        assert_eq!(gate.observe("terminal", "en", t + Duration::from_millis(60)), Decision::Confirm);
-        assert_eq!(gate.observe("terminal", "en", t + Duration::from_millis(120)), Decision::Ready);
+        assert_eq!(
+            gate.observe("terminal", "en", t + Duration::from_millis(60)),
+            Decision::Confirm
+        );
+        assert_eq!(
+            gate.observe("terminal", "en", t + Duration::from_millis(120)),
+            Decision::Ready
+        );
         gate.complete("terminal");
-        assert_eq!(gate.observe("terminal", "en", t + Duration::from_secs(2)), Decision::AlreadyHandled);
+        assert_eq!(
+            gate.observe("terminal", "en", t + Duration::from_secs(2)),
+            Decision::AlreadyHandled
+        );
     }
 
     #[test]
@@ -72,7 +107,10 @@ mod tests {
         let t = Instant::now();
         let mut gate = FocusGate::new(Duration::ZERO);
         gate.complete("runtime-id-1");
-        assert_eq!(gate.observe("runtime-id-1", "zh", t), Decision::AlreadyHandled);
+        assert_eq!(
+            gate.observe("runtime-id-1", "zh", t),
+            Decision::AlreadyHandled
+        );
     }
 
     #[test]
@@ -92,9 +130,18 @@ mod tests {
         let t = Instant::now();
         let mut gate = FocusGate::new(Duration::from_millis(100));
         gate.observe("input", "en", t);
-        assert_eq!(gate.observe("input", "zh", t + Duration::from_millis(120)), Decision::Confirm);
-        assert_eq!(gate.observe("input", "zh", t + Duration::from_millis(150)), Decision::Confirm);
-        assert_eq!(gate.observe("input", "zh", t + Duration::from_millis(240)), Decision::Ready);
+        assert_eq!(
+            gate.observe("input", "zh", t + Duration::from_millis(120)),
+            Decision::Confirm
+        );
+        assert_eq!(
+            gate.observe("input", "zh", t + Duration::from_millis(150)),
+            Decision::Confirm
+        );
+        assert_eq!(
+            gate.observe("input", "zh", t + Duration::from_millis(240)),
+            Decision::Ready
+        );
     }
 
     #[test]
@@ -102,6 +149,9 @@ mod tests {
         let mut gate = FocusGate::new(Duration::ZERO);
         gate.complete("terminal");
         gate.reset();
-        assert_eq!(gate.observe("terminal", "en", Instant::now()), Decision::Confirm);
+        assert_eq!(
+            gate.observe("terminal", "en", Instant::now()),
+            Decision::Confirm
+        );
     }
 }

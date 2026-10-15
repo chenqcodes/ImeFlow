@@ -20,7 +20,9 @@ impl Dib {
         let len = byte_len(width, height)?;
         unsafe {
             let dc = CreateCompatibleDC(HDC::default());
-            if dc.0.is_null() { return Err("CreateCompatibleDC failed".into()); }
+            if dc.0.is_null() {
+                return Err("CreateCompatibleDC failed".into());
+            }
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -34,20 +36,38 @@ impl Dib {
                 ..Default::default()
             };
             let mut bits = std::ptr::null_mut();
-            let bitmap = match CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+            let bitmap = match CreateDIBSection(
+                dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                HANDLE::default(),
+                0,
+            ) {
                 Ok(bitmap) => bitmap,
-                Err(e) => { let _ = DeleteDC(dc); return Err(format!("CreateDIBSection: {e}")); }
+                Err(e) => {
+                    let _ = DeleteDC(dc);
+                    return Err(format!("CreateDIBSection: {e}"));
+                }
             };
             if bits.is_null() {
-                let _ = DeleteObject(bitmap); let _ = DeleteDC(dc);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(dc);
                 return Err("CreateDIBSection returned no pixel buffer".into());
             }
             let previous = SelectObject(dc, bitmap);
             if previous.0.is_null() || previous.0 as isize == -1 {
-                let _ = DeleteObject(bitmap); let _ = DeleteDC(dc);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(dc);
                 return Err("SelectObject(bitmap) failed".into());
             }
-            let mut out = Self { dc, bitmap, previous, bits: bits.cast(), len };
+            let mut out = Self {
+                dc,
+                bitmap,
+                previous,
+                bits: bits.cast(),
+                len,
+            };
             out.bytes_mut().fill(0);
             Ok(out)
         }
@@ -56,13 +76,21 @@ impl Dib {
     #[cfg(test)]
     pub fn bytes(&self) -> &[u8] {
         // GDI may batch draws, so synchronize before CPU access to the DIB.
-        unsafe { let _ = GdiFlush(); std::slice::from_raw_parts(self.bits, self.len) }
+        unsafe {
+            let _ = GdiFlush();
+            std::slice::from_raw_parts(self.bits, self.len)
+        }
     }
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        unsafe { let _ = GdiFlush(); std::slice::from_raw_parts_mut(self.bits, self.len) }
+        unsafe {
+            let _ = GdiFlush();
+            std::slice::from_raw_parts_mut(self.bits, self.len)
+        }
     }
     pub fn write(&mut self, image: &Image) -> Result<(), String> {
-        if image.pixels.len() != self.len { return Err("DIB pixel length mismatch".into()); }
+        if image.pixels.len() != self.len {
+            return Err("DIB pixel length mismatch".into());
+        }
         self.bytes_mut().copy_from_slice(&image.pixels);
         Ok(())
     }
@@ -85,15 +113,29 @@ impl OwnedIcon {
         dib.write(image)?;
         // CreateIconIndirect copies both bitmaps. These temporary resources can be freed.
         unsafe {
-            let mask_bytes = vec![0u8; ((image.width + 15) / 16) * 2 * image.height];
-            let mask = CreateBitmap(image.width as i32, image.height as i32, 1, 1,
-                Some(mask_bytes.as_ptr().cast()));
-            if mask.0.is_null() { return Err("CreateBitmap(icon mask) failed".into()); }
+            let mask_bytes = vec![0u8; image.width.div_ceil(16) * 2 * image.height];
+            let mask = CreateBitmap(
+                image.width as i32,
+                image.height as i32,
+                1,
+                1,
+                Some(mask_bytes.as_ptr().cast()),
+            );
+            if mask.0.is_null() {
+                return Err("CreateBitmap(icon mask) failed".into());
+            }
             // CreateIconIndirect may select the bitmaps internally; do not pass a bitmap
             // still selected into our memory DC.
             let _ = SelectObject(dib.dc, dib.previous);
-            let info = ICONINFO { fIcon: BOOL(1), hbmMask: mask, hbmColor: dib.bitmap, ..Default::default() };
-            let result = CreateIconIndirect(&info).map(Self).map_err(|e| format!("CreateIconIndirect: {e}"));
+            let info = ICONINFO {
+                fIcon: BOOL(1),
+                hbmMask: mask,
+                hbmColor: dib.bitmap,
+                ..Default::default()
+            };
+            let result = CreateIconIndirect(&info)
+                .map(Self)
+                .map_err(|e| format!("CreateIconIndirect: {e}"));
             let _ = DeleteObject(mask);
             result
         }
@@ -105,7 +147,11 @@ impl OwnedIcon {
     }
 }
 impl Drop for OwnedIcon {
-    fn drop(&mut self) { unsafe { let _ = DestroyIcon(self.0); } }
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyIcon(self.0);
+        }
+    }
 }
 
 #[cfg(test)]
