@@ -3,3 +3,13 @@
 .local/
 .diagnostics/
 *.pdb
+.env
+.env.*
+!.env.example
+
+# Local editor notes and runtime state are not part of the public source tree.
+/.cursor/
+*.log
+rules.toml.bak
+rules.toml.*.tmp
+stats.toml
