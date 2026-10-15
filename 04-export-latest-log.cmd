@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 title ImeFlow - Export Latest Key Log
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\export-latest-key-log.ps1"
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\export-latest-key-log.ps1"
 set "code=%errorlevel%"
 
 echo.

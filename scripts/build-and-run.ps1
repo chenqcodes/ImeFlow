@@ -2,63 +2,51 @@ param(
     [switch]$Run,
     [switch]$Release,
     [switch]$Lint,
+    [string]$TargetDir = '',
     [string[]]$ImeArgs = @()
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$version = '0.1.0-m1'
+. (Join-Path $PSScriptRoot 'common.ps1')
+$version = Get-ImeFlowBuildId
 Push-Location $root
 try {
-    # Check before compiling, rather than failing when rustc tries to replace a running EXE.
-    if (@(Get-Process -Name imeflow -ErrorAction SilentlyContinue).Count -gt 0) {
-        throw 'An imeflow.exe is running. Exit it from the tray first. No process was killed.'
-    }
     $profile = if ($Release) { 'release' } else { 'debug' }
-    $cargoArgs = @('test', '--locked')
+    $targetRoot = if ($TargetDir) { [System.IO.Path]::GetFullPath((Join-Path $root $TargetDir)) } else { Join-Path $root 'target' }
+    $bin = Join-Path $targetRoot $profile
+    $exe = Join-Path $bin 'imeflow.exe'
+    # Check before compiling, rather than failing when rustc tries to replace a running EXE.
+    $running = @(Get-Process -Name imeflow -ErrorAction SilentlyContinue)
+    if (($Run -and $running.Count -gt 0) -or @($running | Where-Object { $_.Path -eq $exe }).Count -gt 0) {
+        throw 'A conflicting imeflow.exe is running. Exit it from the tray first. No process was killed.'
+    }
+    $cargoArgs = @('test', '--locked', '--target-dir', $targetRoot)
     if ($Release) { $cargoArgs += '--release' }
     & cargo @cargoArgs
     if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed; app was not started.' }
 
     if ($Lint) {
-        $lintArgs = @('clippy', '--all-targets', '--locked')
+        $lintArgs = @('clippy', '--all-targets', '--locked', '--target-dir', $targetRoot)
         if ($Release) { $lintArgs += '--release' }
         $lintArgs += @('--', '-D', 'warnings')
         & cargo @lintArgs
         if ($LASTEXITCODE -ne 0) { throw 'Clippy failed; app was not started.' }
     }
-    $buildArgs = @('build', '--locked')
+    $buildArgs = @('build', '--locked', '--target-dir', $targetRoot)
     if ($Release) { $buildArgs += '--release' }
     & cargo @buildArgs
     if ($LASTEXITCODE -ne 0) { throw 'Build failed; app was not started.' }
 
-    $bin = Join-Path $root ("target/{0}" -f $profile)
-    Copy-Item -LiteralPath (Join-Path $root 'rules.toml') -Destination (Join-Path $bin 'rules.toml') -Force
+    Initialize-ImeFlowRules -Root $root -Bin $bin
     & (Join-Path $PSScriptRoot 'copy-assets.ps1') -Bin $bin
-    $exe = Join-Path $bin 'imeflow.exe'
     Write-Host 'Checking deployed PNG assets (no input hooks or IME changes)...'
-    & $exe --check-assets
-    if ($LASTEXITCODE -ne 0) { throw 'PNG validation failed; app was not started.' }
+    $assetCheck = Invoke-ImeFlowProcess -Exe $exe -ImeArgs @('--check-assets')
+    if ($assetCheck.ExitCode -ne 0) { throw "PNG validation failed; app was not started. $($assetCheck.Error)" }
     Set-Content -LiteralPath (Join-Path $bin 'imeflow-build.id') -Value $version -Encoding ASCII
     Write-Host "Verified $version ($profile): $exe"
 
     if ($Run) {
-        $diagnostics = Join-Path $root '.diagnostics'
-        New-Item -ItemType Directory -Path $diagnostics -Force | Out-Null
-        $log = Join-Path $diagnostics ('m1-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log')
-        Write-Host "Log: $log"
-        Write-Host 'Tray: auto / autostart / logs / exit'
-        $previousLog = $env:RUST_LOG
-        $previousDir = $env:IMEFLOW_LOG_DIR
-        try {
-            $env:RUST_LOG = 'info'
-            $env:IMEFLOW_LOG_DIR = $diagnostics
-            & $exe @ImeArgs 2>&1 | Tee-Object -FilePath $log
-            if ($LASTEXITCODE -ne 0) { throw "ImeFlow exited with code $LASTEXITCODE; see $log" }
-        }
-        finally {
-            $env:RUST_LOG = $previousLog
-            $env:IMEFLOW_LOG_DIR = $previousDir
-        }
+        Invoke-ImeFlowSession -Exe $exe -ImeArgs $ImeArgs
     } else {
         Write-Host 'Verification complete. The IME automation was NOT started.'
     }

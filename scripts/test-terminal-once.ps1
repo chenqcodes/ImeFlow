@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'common.ps1')
 Push-Location $root
 try {
     # Separate output directory: do not overwrite or restart the previous build.
@@ -17,27 +18,18 @@ try {
 
     $bin = Join-Path $root 'target/terminal-once/debug'
     Copy-Item -LiteralPath (Join-Path $root 'rules.toml') -Destination (Join-Path $bin 'rules.toml') -Force
+    & (Join-Path $PSScriptRoot 'copy-assets.ps1') -Bin $bin
     $exe = Join-Path $bin 'imeflow.exe'
-    Write-Host "Built terminal-once-v10: $exe"
+    $assetCheck = Invoke-ImeFlowProcess -Exe $exe -ImeArgs @('--check-assets')
+    if ($assetCheck.ExitCode -ne 0) { throw "Asset validation failed. $($assetCheck.Error)" }
+    Write-Host "Built $(Get-ImeFlowBuildId) (terminal-once): $exe"
 
     if ($Run) {
         $running = @(Get-Process -Name imeflow -ErrorAction SilentlyContinue)
         if ($running.Count -gt 0) {
             throw 'An imeflow.exe is still running. Close it manually, then rerun this script. No process was killed.'
         }
-        $diagnostics = Join-Path $root '.diagnostics'
-        New-Item -ItemType Directory -Path $diagnostics -Force | Out-Null
-        $log = Join-Path $diagnostics ('terminal-once-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
-        Write-Host "Diagnostic log: $log"
-        Write-Host 'Phase1: Shift LL watch is ON. Optional letter probe: -ImeArgs --trace-probe'
-        Write-Host 'Select WeChat IME, then test chat -> integrated terminal; look for key_trace lines.'
-        $previousLog = $env:RUST_LOG
-        try {
-            $env:RUST_LOG = 'debug'
-            & $exe @ImeArgs 2>&1 | Tee-Object -FilePath $log
-            if ($LASTEXITCODE -ne 0) { throw "ImeFlow exited with code $LASTEXITCODE; see $log" }
-        }
-        finally { $env:RUST_LOG = $previousLog }
+        Invoke-ImeFlowSession -Exe $exe -ImeArgs $ImeArgs -LogLevel 'debug'
     }
 }
 finally { Pop-Location }

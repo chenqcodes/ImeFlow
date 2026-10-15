@@ -8,7 +8,7 @@ echo   ImeFlow 0.1.0-m1 - test, build, PNG check, then run
 echo ========================================
 echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-and-run.ps1" -Run
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-and-run.ps1" -Run
 set "code=%errorlevel%"
 
 echo.

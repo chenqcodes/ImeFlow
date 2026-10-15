@@ -2,6 +2,7 @@ param([switch]$NoPause)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'common.ps1')
 $bin = Join-Path $root 'target/terminal-once/debug'
 $exe = Join-Path $bin 'imeflow.exe'
 $rules = Join-Path $root 'rules.toml'
@@ -19,29 +20,8 @@ try {
 
     Copy-Item -LiteralPath $rules -Destination $targetRules -Force
 
-    $diagnostics = Join-Path $root '.diagnostics'
-    New-Item -ItemType Directory -Path $diagnostics -Force | Out-Null
-    $log = Join-Path $diagnostics ('terminal-once-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
-
-    Write-Host 'Starting ImeFlow experimental build...'
-    Write-Host "EXE: $exe"
-    Write-Host "LOG: $log"
-    Write-Host 'Close this window or press Ctrl+C to stop ImeFlow.'
-    Write-Host ''
-
-    $previousLog = $env:RUST_LOG
-    try {
-        $env:RUST_LOG = 'debug'
-        & $exe 2>&1 | Tee-Object -FilePath $log
-        $code = $LASTEXITCODE
-    }
-    finally {
-        $env:RUST_LOG = $previousLog
-    }
-
-    if ($code -ne 0) {
-        throw "ImeFlow exited with code $code. See: $log"
-    }
+    & (Join-Path $PSScriptRoot 'copy-assets.ps1') -Bin $bin
+    Invoke-ImeFlowSession -Exe $exe -LogLevel 'debug'
 }
 catch {
     Write-Host ''

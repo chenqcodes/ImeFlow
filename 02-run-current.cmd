@@ -9,7 +9,7 @@ echo   No compile, no tests.
 echo ========================================
 echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-current.ps1"
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-current.ps1"
 set "code=%errorlevel%"
 
 if not "%code%"=="0" (

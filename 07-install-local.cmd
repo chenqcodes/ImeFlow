@@ -15,7 +15,7 @@ if not exist "%~dp0dist\ImeFlow\imeflow.exe" (
     exit /b 1
 )
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-local.ps1" -From "%~dp0dist\ImeFlow"
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-local.ps1" -From "%~dp0dist\ImeFlow"
 set "code=%errorlevel%"
 
 if not "%code%"=="0" (

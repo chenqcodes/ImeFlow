@@ -3,7 +3,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$version = '0.1.0-m1'
+. (Join-Path $PSScriptRoot 'common.ps1')
+$version = Get-ImeFlowBuildId
 Push-Location $root
 try {
     $running = @(Get-Process -Name imeflow -ErrorAction SilentlyContinue)
@@ -26,6 +27,11 @@ try {
 
     Copy-Item -LiteralPath (Join-Path $srcBin 'imeflow.exe') -Destination (Join-Path $dist 'imeflow.exe') -Force
     Copy-Item -LiteralPath (Join-Path $root 'rules.toml') -Destination (Join-Path $dist 'rules.toml') -Force
+    Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $dist 'README.md') -Force
+    Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $dist 'LICENSE') -Force
+    & (Join-Path $PSScriptRoot 'export-dependency-licenses.ps1') -Destination $dist
+    New-Item -ItemType Directory -Path (Join-Path $dist 'docs') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'docs/rules-guide.md') -Destination (Join-Path $dist 'docs/rules-guide.md') -Force
     & (Join-Path $PSScriptRoot 'copy-assets.ps1') -Bin $dist
 
     $launch = @"
@@ -36,11 +42,11 @@ start "" "%~dp0imeflow.exe"
     Set-Content -LiteralPath (Join-Path $dist '启动 ImeFlow.cmd') -Value $launch -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $dist 'imeflow-build.id') -Value $version -Encoding ASCII
 
-    & (Join-Path $dist 'imeflow.exe') --check-assets
-    if ($LASTEXITCODE -ne 0) { throw 'PNG validation failed in dist package.' }
+    $assetCheck = Invoke-ImeFlowProcess -Exe (Join-Path $dist 'imeflow.exe') -ImeArgs @('--check-assets')
+    if ($assetCheck.ExitCode -ne 0) { throw "PNG validation failed in dist package. $($assetCheck.Error)" }
 
     Write-Host "Package ready: $dist"
-    Write-Host 'Contents: imeflow.exe, rules.toml, assets/, 启动 ImeFlow.cmd'
+    Write-Host 'Contents: imeflow.exe, rules.toml, assets/, README.md, docs/, LICENSE, licenses/, THIRD_PARTY_NOTICES.txt, 启动 ImeFlow.cmd'
 
     if ($Install) {
         & (Join-Path $PSScriptRoot 'install-local.ps1') -From $dist
