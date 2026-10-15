@@ -4,6 +4,8 @@
 
 <h1 align="center">ImeFlow</h1>
 
+<p align="center"><strong>简体中文</strong> | <a href="README.en.md">English</a></p>
+
 <p align="center"><strong>让输入法跟随工作流。</strong><br>Let the IME follow your flow.</p>
 
 写代码、敲命令、回消息，专注不该被一次次中英文切换打断。
@@ -18,6 +20,14 @@ ImeFlow 是面向 Windows 的输入模式自动切换工具。它感知当前应
 - **常驻托盘**：蓝色「中E」合字连接两种输入状态，提供自动切换开关、状态提示和日志入口。
 
 ## 运行
+
+### 下载使用
+
+当前版本为 **0.1.0**，支持 Windows 10/11 x64。从 [GitHub Releases](https://github.com/chenqcodes/ImeFlow/releases/latest) 下载 `ImeFlow-0.1.0-windows-x64.zip`，完整解压后运行 `imeflow.exe`，程序会常驻系统托盘。预编译发布包不需要安装 Rust 或 PowerShell 7。界面目前为中文；中英文切换入口用于阅读项目文档。
+
+升级前先退出托盘中的旧实例，并备份原有 `rules.toml`；手动解压覆盖时保留自己的规则。微信输入法用户请先阅读下方的输入法配置与兼容性说明。
+
+### 从源码构建
 
 需要 Windows 10/11、PowerShell 7（`pwsh.exe`）及 Rust 工具链；本轮使用 Rust 1.98.1 验证。
 

@@ -28,6 +28,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $srcBin 'imeflow.exe') -Destination (Join-Path $dist 'imeflow.exe') -Force
     Copy-Item -LiteralPath (Join-Path $root 'rules.toml') -Destination (Join-Path $dist 'rules.toml') -Force
     Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $dist 'README.md') -Force
+    Copy-Item -LiteralPath (Join-Path $root 'README.en.md') -Destination (Join-Path $dist 'README.en.md') -Force
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $dist 'LICENSE') -Force
     & (Join-Path $PSScriptRoot 'export-dependency-licenses.ps1') -Destination $dist
     New-Item -ItemType Directory -Path (Join-Path $dist 'docs') -Force | Out-Null

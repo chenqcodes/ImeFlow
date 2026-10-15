@@ -33,6 +33,9 @@ foreach ($licenseItem in @('LICENSE', 'THIRD_PARTY_NOTICES.txt', 'licenses')) {
 if (Test-Path -LiteralPath (Join-Path $From 'README.md')) {
     Copy-Item -LiteralPath (Join-Path $From 'README.md') -Destination (Join-Path $app 'README.md') -Force
 }
+if (Test-Path -LiteralPath (Join-Path $From 'README.en.md')) {
+    Copy-Item -LiteralPath (Join-Path $From 'README.en.md') -Destination (Join-Path $app 'README.en.md') -Force
+}
 if (Test-Path -LiteralPath (Join-Path $From 'docs/rules-guide.md')) {
     New-Item -ItemType Directory -Path (Join-Path $app 'docs') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $From 'docs/rules-guide.md') -Destination (Join-Path $app 'docs/rules-guide.md') -Force
