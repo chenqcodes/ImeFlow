@@ -1,195 +1,57 @@
-# ImeFlow rules
-# native-chinese: 中文 IME 中；ime-english: 同一 IME 英；layout-english: 显式 ENG。
-# control: terminal | address-bar | edit | password | other
-# terminal: 仅当 resolve 为「中」才 Shift；Unknown 无记忆则跳过（不盲拨）。
-# 浏览器：地址栏英、网页输入框中；独立终端默认 IME 英。
-#
-# 经验（详见 .cursor/rules/wechat-ime-settings.mdc）：
-# - 先读实际层再 Shift；记忆只兜 Unknown。微信 IMM「中(closed)」不可信。
-# - 勿因 passthrough/失焦清空层记忆后盲 Shift。
-# - 英中英多为焦点路过输入框，用短时 block_chinese，不要二次 Shift。
-# - Monaco 代码 Edit ≠ 聊天 Edit（进程默认英）。
-#
-# 微信输入法（本机已确认相关）：
-# - 「默认输入状态」建议设为「切换中英文对所有应用生效」。
-# - 否则微信可能按应用分别记住中/英；切到 Cursor/xterm 时 TIP 会按该应用旧状态恢复。
-# - 微软拼音在相同路径上通常更稳。
+# 通用默认：不需要为每个软件重复配置。
+# 手动控件规则 > 软件区域规则 > 软件默认 > 通用默认。
+# 英文指当前中文输入法的英文状态；layout-english 才是 ENG 布局。
+[defaults]
+edit = "native-chinese"
+terminal = "ime-english"
+address-bar = "ime-english"
+password = "ime-english"
+code-editor = "ime-english"
+other = "passthrough"
 
-[[rules]]
-process = "Cursor.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "Cursor.exe"
-control = "password"
-mode = "passthrough"
-
-[[rules]]
-process = "Cursor.exe"
-control = "edit"
-mode = "native-chinese"
-
-[[rules]]
-process = "Cursor.exe"
-mode = "ime-english"
-
-[[rules]]
-process = "Code.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "Code.exe"
-control = "password"
-mode = "passthrough"
-
-[[rules]]
-process = "Code.exe"
-control = "edit"
-mode = "native-chinese"
-
-[[rules]]
-process = "Code.exe"
-mode = "ime-english"
-
+# 常用软件补充：仅补足未分类区域，不覆盖已识别的密码框、终端等。
+# 若不需要这些预设，可通过点选面板删除对应的“此软件同类区域”规则。
 [[rules]]
 process = "WeChat.exe"
+control = "other"
 mode = "native-chinese"
 
 [[rules]]
 process = "Weixin.exe"
+control = "other"
 mode = "native-chinese"
 
 [[rules]]
 process = "ChatGPT.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "ChatGPT.exe"
-control = "edit"
-mode = "native-chinese"
-
-[[rules]]
-process = "ChatGPT.exe"
-mode = "native-chinese"
-
-# Optional exact-name rule; active only if the foreground executable is Codex.exe.
-[[rules]]
-process = "Codex.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "Codex.exe"
-control = "edit"
+control = "other"
 mode = "native-chinese"
 
 [[rules]]
 process = "notepad.exe"
+control = "other"
 mode = "native-chinese"
 
-# --- 独立终端：默认使用中文 IME 内的「英」 ---
 [[rules]]
 process = "WindowsTerminal.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "WindowsTerminal.exe"
+control = "other"
 mode = "ime-english"
 
 [[rules]]
 process = "powershell.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "powershell.exe"
+control = "other"
 mode = "ime-english"
 
 [[rules]]
 process = "pwsh.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "pwsh.exe"
+control = "other"
 mode = "ime-english"
 
 [[rules]]
 process = "cmd.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "cmd.exe"
+control = "other"
 mode = "ime-english"
 
 [[rules]]
 process = "conhost.exe"
-control = "terminal"
+control = "other"
 mode = "ime-english"
-
-[[rules]]
-process = "conhost.exe"
-mode = "ime-english"
-
-# --- 浏览器：地址栏英，网页终端英，网页输入框中；其余不干预 ---
-[[rules]]
-process = "msedge.exe"
-control = "address-bar"
-mode = "ime-english"
-
-[[rules]]
-process = "msedge.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "msedge.exe"
-control = "edit"
-mode = "native-chinese"
-
-[[rules]]
-process = "msedge.exe"
-mode = "passthrough"
-
-[[rules]]
-process = "chrome.exe"
-control = "address-bar"
-mode = "ime-english"
-
-[[rules]]
-process = "chrome.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "chrome.exe"
-control = "edit"
-mode = "native-chinese"
-
-[[rules]]
-process = "chrome.exe"
-mode = "passthrough"
-
-[[rules]]
-process = "firefox.exe"
-control = "address-bar"
-mode = "ime-english"
-
-[[rules]]
-process = "firefox.exe"
-control = "terminal"
-mode = "ime-english"
-
-[[rules]]
-process = "firefox.exe"
-control = "edit"
-mode = "native-chinese"
-
-[[rules]]
-process = "firefox.exe"
-mode = "passthrough"

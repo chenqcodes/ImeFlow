@@ -1,5 +1,6 @@
 //! Inspect the focused UI Automation element (control-level IME rules).
 
+use std::cell::RefCell;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
@@ -7,27 +8,58 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, UIA_DocumentControlTypeId,
     UIA_EditControlTypeId, UIA_CONTROLTYPE_ID,
 };
+use windows::Win32::UI::Accessibility::{
+    IUIAutomationCacheRequest, TreeScope_Element, UIA_AriaRolePropertyId, UIA_BoundingRectanglePropertyId,
+    UIA_AutomationIdPropertyId, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
+    UIA_IsPasswordPropertyId, UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
+    UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId,
+};
 
-static COM: std::sync::Once = std::sync::Once::new();
-
-fn ensure_com() {
-    COM.call_once(|| unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    });
+thread_local! {
+    static AUTOMATION: RefCell<Option<(IUIAutomation, IUIAutomationCacheRequest)>> = const { RefCell::new(None) };
 }
 
-fn automation() -> Option<IUIAutomation> {
-    ensure_com();
-    // ponytail: recreate per call — IUIAutomation is !Send; V0 stays on message thread.
-    unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() }
+fn automation() -> Option<(IUIAutomation, IUIAutomationCacheRequest)> {
+    // COM apartments and interface ownership are per thread.
+    AUTOMATION.with(|slot| {
+        if slot.borrow().is_none() {
+            unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok()?;
+            }
+            let auto: IUIAutomation =
+                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()? };
+            let cache = unsafe { auto.CreateCacheRequest().ok()? };
+            unsafe {
+                cache.SetTreeScope(TreeScope_Element).ok()?;
+                for property in [
+                    UIA_NamePropertyId,
+                    UIA_ClassNamePropertyId,
+                    UIA_AutomationIdPropertyId,
+                    UIA_LocalizedControlTypePropertyId,
+                    UIA_AriaRolePropertyId,
+                    UIA_ControlTypePropertyId,
+                    UIA_IsPasswordPropertyId,
+                    UIA_ProcessIdPropertyId,
+                    UIA_BoundingRectanglePropertyId,
+                    UIA_NativeWindowHandlePropertyId,
+                ] {
+                    cache.AddProperty(property).ok()?;
+                }
+            }
+            *slot.borrow_mut() = Some((auto, cache));
+        }
+        slot.borrow().clone()
+    })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ControlKind {
     Terminal,
     AddressBar,
     Edit,
     Password,
+    CodeEditor,
+    #[default]
     Other,
 }
 
@@ -38,6 +70,7 @@ impl ControlKind {
             Self::AddressBar => "address-bar",
             Self::Edit => "edit",
             Self::Password => "password",
+            Self::CodeEditor => "code-editor",
             Self::Other => "other",
         }
     }
@@ -48,14 +81,37 @@ impl ControlKind {
             "address-bar" | "addressbar" | "omnibox" | "url" => Some(Self::AddressBar),
             "edit" | "input" | "textbox" | "chat" => Some(Self::Edit),
             "password" => Some(Self::Password),
+            "code-editor" => Some(Self::CodeEditor),
             "other" | "*" => Some(Self::Other),
             _ => None,
+        }
+    }
+
+    pub const ALL: [Self; 6] = [
+        Self::Edit,
+        Self::Terminal,
+        Self::AddressBar,
+        Self::Password,
+        Self::CodeEditor,
+        Self::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Edit => "普通输入框",
+            Self::Terminal => "终端",
+            Self::AddressBar => "浏览器地址栏",
+            Self::Password => "密码框",
+            Self::CodeEditor => "代码编辑区",
+            Self::Other => "其他 / 无法识别的区域",
         }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FocusInfo {
+    /// Screen rectangle for the opt-in picker overlay, never a persisted selector.
+    pub bounding_rect: Option<[i32; 4]>,
     pub name: String,
     pub class_name: String,
     pub automation_id: String,
@@ -71,48 +127,68 @@ pub struct FocusInfo {
     pub runtime_id: Vec<i32>,
 }
 
-impl Default for ControlKind {
-    fn default() -> Self {
-        Self::Other
-    }
-}
-
 impl FocusInfo {
-    pub fn summarize(&self) -> String {
+    /// Ordinary logs retain classification evidence, never UIA names or ancestor text.
+    pub fn log_summary(&self) -> String {
+        let structure = format!(
+            "{} {} {}",
+            self.class_name, self.automation_id, self.breadcrumb
+        )
+        .to_ascii_lowercase();
         format!(
-            "{} | type={} name=\"{}\" role=\"{}\" id=\"{}\" path=\"{}\"",
+            "kind={} type={} navigation={} xterm={} monaco={} composer={} ancestors={}",
             self.kind.as_str(),
             self.control_type,
-            trunc(&self.name, 36),
-            trunc(&self.aria_role, 20),
-            trunc(&self.automation_id, 20),
-            trunc(&self.breadcrumb, 48)
+            self.is_navigation_control(),
+            structure.contains("xterm"),
+            structure.contains("monaco"),
+            contains_any(
+                &[&structure],
+                &["composer", "ui-prompt-input", "chat-input"]
+            ),
+            self.breadcrumb
+                .split(" < ")
+                .filter(|part| !part.is_empty())
+                .count()
         )
+    }
+
+    pub fn is_navigation_control(&self) -> bool {
+        is_navigation_control(self.control_type, &self.aria_role)
     }
 
     /// Stronger evidence that an Edit element is a real chat/prompt input rather than
     /// xterm.js briefly moving focus through a helper textarea.
     pub fn looks_explicit_chat_input(&self) -> bool {
-        let name = self.name.to_ascii_lowercase();
         let id = self.automation_id.to_ascii_lowercase();
         let path = self.breadcrumb.to_ascii_lowercase();
+        if contains_any(
+            &[&self.class_name.to_ascii_lowercase(), &path],
+            &["monaco-editor", "overflow-guard"],
+        ) && !contains_any(
+            &[&id, &path],
+            &["ui-prompt-input", "composer", "chat-input", "prompt-input"],
+        ) {
+            return false;
+        }
         contains_any(
-            &[&name, &id, &path],
+            &[&self.name.to_ascii_lowercase(), &id, &path],
             &[
-                "codex", "chat", "ask", "prompt", "composer", "follow-up",
-                "follow up", "question", "提问", "对话", "随心输入", "ui-prompt-input",
+                "codex",
+                "chat",
+                "ask",
+                "prompt",
+                "composer",
+                "follow-up",
+                "follow up",
+                "question",
+                "提问",
+                "对话",
+                "随心输入",
+                "ui-prompt-input",
                 "composer-messages",
             ],
         )
-    }
-}
-
-fn trunc(s: &str, n: usize) -> String {
-    let t: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
-        format!("{t}…")
-    } else {
-        t
     }
 }
 
@@ -122,51 +198,89 @@ fn bstr_to_string(b: windows::core::BSTR) -> String {
 
 /// Snapshot the currently focused UIA element (+ parent breadcrumb).
 pub fn inspect_focused() -> Option<FocusInfo> {
-    let auto = automation()?;
-    let el = unsafe { auto.GetFocusedElement().ok()? };
-    Some(inspect_element(&auto, &el))
+    let (auto, cache) = automation()?;
+    let el = unsafe { auto.GetFocusedElementBuildCache(&cache).ok()? };
+    Some(inspect_element(&auto, &cache, &el))
 }
 
-fn inspect_element(auto: &IUIAutomation, el: &IUIAutomationElement) -> FocusInfo {
-    let name = unsafe { el.CurrentName().ok().map(bstr_to_string).unwrap_or_default() };
+/// Opt-in picker check, never run on the automatic switching hot path.
+/// The scope is an executable's matching identifiers, not a permanent RuntimeId.
+pub fn identifier_unique_in_window(
+    root: windows::Win32::Foundation::HWND,
+    focus: &FocusInfo,
+) -> bool {
+    use windows::Win32::UI::Accessibility::TreeScope_Subtree;
+    let check = || -> Option<bool> {
+        if focus.automation_id.trim().is_empty() {
+            return Some(false);
+        }
+        let (auto, cache) = automation()?;
+        unsafe {
+            let root = auto.ElementFromHandleBuildCache(root, &cache).ok()?;
+            let condition = auto
+                .CreatePropertyCondition(
+                    UIA_AutomationIdPropertyId,
+                    &windows::core::VARIANT::from(focus.automation_id.as_str()),
+                )
+                .ok()?;
+            let matches = root
+                .FindAllBuildCache(TreeScope_Subtree, &condition, &cache)
+                .ok()?;
+            // A shared automation ID is not specific enough, even if other fields differ.
+            if matches.Length().ok()? != 1 {
+                return Some(false);
+            }
+            let matched = matches.GetElement(0).ok()?;
+            Some(element_runtime_id(&matched) == focus.runtime_id && !focus.runtime_id.is_empty())
+        }
+    };
+    check().unwrap_or(false)
+}
+
+fn inspect_element(
+    auto: &IUIAutomation,
+    cache: &IUIAutomationCacheRequest,
+    el: &IUIAutomationElement,
+) -> FocusInfo {
+    let name = unsafe { el.CachedName().ok().map(bstr_to_string).unwrap_or_default() };
     let class_name = unsafe {
-        el.CurrentClassName()
+        el.CachedClassName()
             .ok()
             .map(bstr_to_string)
             .unwrap_or_default()
     };
     let automation_id = unsafe {
-        el.CurrentAutomationId()
+        el.CachedAutomationId()
             .ok()
             .map(bstr_to_string)
             .unwrap_or_default()
     };
     let localized_type = unsafe {
-        el.CurrentLocalizedControlType()
+        el.CachedLocalizedControlType()
             .ok()
             .map(bstr_to_string)
             .unwrap_or_default()
     };
     let aria_role = unsafe {
-        el.CurrentAriaRole()
+        el.CachedAriaRole()
             .ok()
             .map(bstr_to_string)
             .unwrap_or_default()
     };
     let control_type = unsafe {
-        el.CurrentControlType()
+        el.CachedControlType()
             .ok()
             .map(|c: UIA_CONTROLTYPE_ID| c.0)
             .unwrap_or(0)
     };
     let is_password = unsafe {
-        el.CurrentIsPassword()
+        el.CachedIsPassword()
             .ok()
             .map(|b| b.as_bool())
             .unwrap_or(false)
     };
 
-    let breadcrumb = parent_breadcrumb(auto, el, 8);
+    let (breadcrumb, owner_root) = ancestor_metadata(auto, cache, el);
     let kind = classify_focus(
         control_type,
         is_password,
@@ -179,6 +293,7 @@ fn inspect_element(auto: &IUIAutomation, el: &IUIAutomationElement) -> FocusInfo
     );
 
     FocusInfo {
+        bounding_rect: unsafe { el.CachedBoundingRectangle().ok().map(|r| [r.left, r.top, r.right, r.bottom]) },
         name,
         class_name,
         automation_id,
@@ -188,8 +303,8 @@ fn inspect_element(auto: &IUIAutomation, el: &IUIAutomationElement) -> FocusInfo
         is_password,
         kind,
         breadcrumb,
-        process_id: unsafe { el.CurrentProcessId().unwrap_or(0).max(0) as u32 },
-        owner_root: element_owner_root(auto, el),
+        process_id: unsafe { el.CachedProcessId().unwrap_or(0).max(0) as u32 },
+        owner_root,
         runtime_id: element_runtime_id(el),
     }
 }
@@ -200,19 +315,31 @@ fn element_runtime_id(el: &IUIAutomationElement) -> Vec<i32> {
         SafeArrayGetLBound, SafeArrayGetUBound,
     };
     unsafe {
-        let Ok(array) = el.GetRuntimeId() else { return Vec::new() };
-        if array.is_null() { return Vec::new(); }
+        let Ok(array) = el.GetRuntimeId() else {
+            return Vec::new();
+        };
+        if array.is_null() {
+            return Vec::new();
+        }
         let read = || -> Option<Vec<i32>> {
-            if SafeArrayGetDim(array) != 1 || SafeArrayGetElemsize(array) != 4 { return None; }
+            if SafeArrayGetDim(array) != 1 || SafeArrayGetElemsize(array) != 4 {
+                return None;
+            }
             let lo = SafeArrayGetLBound(array, 1).ok()?;
             let hi = SafeArrayGetUBound(array, 1).ok()?;
             let count = i64::from(hi) - i64::from(lo) + 1;
-            if !(1..=64).contains(&count) { return None; }
+            if !(1..=64).contains(&count) {
+                return None;
+            }
             let mut out = Vec::with_capacity(count as usize);
             for index in lo..=hi {
                 let mut value = 0i32;
-                SafeArrayGetElement(array, &index,
-                    &mut value as *mut i32 as *mut std::ffi::c_void).ok()?;
+                SafeArrayGetElement(
+                    array,
+                    &index,
+                    &mut value as *mut i32 as *mut std::ffi::c_void,
+                )
+                .ok()?;
                 out.push(value);
             }
             Some(out)
@@ -223,44 +350,72 @@ fn element_runtime_id(el: &IUIAutomationElement) -> Vec<i32> {
     }
 }
 
-fn element_owner_root(auto: &IUIAutomation, el: &IUIAutomationElement) -> isize {
-    let Ok(walker) = (unsafe { auto.RawViewWalker() }) else { return 0 };
+fn ancestor_metadata(
+    auto: &IUIAutomation,
+    cache: &IUIAutomationCacheRequest,
+    el: &IUIAutomationElement,
+) -> (String, isize) {
+    use windows::Win32::UI::Accessibility::UIA_WindowControlTypeId;
+    let Ok(walker) = (unsafe { auto.RawViewWalker() }) else {
+        return (String::new(), 0);
+    };
     let mut current = el.clone();
-    for _ in 0..20 {
-        let hwnd = unsafe { current.CurrentNativeWindowHandle().unwrap_or_default() };
-        if !hwnd.0.is_null() {
-            return crate::process::root_hwnd(hwnd).0 as isize;
+    let mut parts = Vec::new();
+    let mut owner_root = 0;
+    let mut include_names = true;
+    for depth in 0..20 {
+        let hwnd = unsafe { current.CachedNativeWindowHandle().unwrap_or_default() };
+        if owner_root == 0 && !hwnd.0.is_null() {
+            owner_root = crate::process::root_hwnd(hwnd).0 as isize;
         }
-        let Ok(parent) = (unsafe { walker.GetParentElement(&current) }) else { break };
+        if unsafe { current.CachedControlType().ok() } == Some(UIA_WindowControlTypeId) {
+            include_names = false; // Window titles must never classify an input region.
+        }
+        if depth > 0 && depth <= 8 && include_names {
+            let n = unsafe {
+                current
+                    .CachedName()
+                    .ok()
+                    .map(bstr_to_string)
+                    .unwrap_or_default()
+            };
+            let t = unsafe {
+                current
+                    .CachedLocalizedControlType()
+                    .ok()
+                    .map(bstr_to_string)
+                    .unwrap_or_default()
+            };
+            let id = unsafe {
+                current
+                    .CachedAutomationId()
+                    .ok()
+                    .map(bstr_to_string)
+                    .unwrap_or_default()
+            };
+            let class = unsafe {
+                current
+                    .CachedClassName()
+                    .ok()
+                    .map(bstr_to_string)
+                    .unwrap_or_default()
+            };
+            if !n.is_empty() || !t.is_empty() || !id.is_empty() || !class.is_empty() {
+                parts.push(format!("{t}:{n}#{id}[{class}]"));
+            }
+        }
+        if owner_root != 0 && (!include_names || depth >= 8) {
+            break;
+        }
+        let Ok(parent) = (unsafe { walker.GetParentElementBuildCache(&current, cache) }) else {
+            break;
+        };
         current = parent;
     }
-    0
+    (parts.join(" < "), owner_root)
 }
-
-fn parent_breadcrumb(auto: &IUIAutomation, el: &IUIAutomationElement, depth: usize) -> String {
-    use windows::Win32::UI::Accessibility::UIA_WindowControlTypeId;
-    let mut parts = Vec::new();
-    // Raw view retains xterm/helper ancestors that control view may omit.
-    let Ok(walker) = (unsafe { auto.RawViewWalker() }) else { return String::new() };
-    let mut cur = el.clone();
-    for _ in 0..depth {
-        let Ok(p) = (unsafe { walker.GetParentElement(&cur) }) else { break };
-        if unsafe { p.CurrentControlType().ok() } == Some(UIA_WindowControlTypeId) {
-            break; // A window title is not evidence that its focused child is a chat box.
-        }
-        let n = unsafe { p.CurrentName().ok().map(bstr_to_string).unwrap_or_default() };
-        let t = unsafe { p.CurrentLocalizedControlType().ok().map(bstr_to_string).unwrap_or_default() };
-        let id = unsafe { p.CurrentAutomationId().ok().map(bstr_to_string).unwrap_or_default() };
-        let class = unsafe { p.CurrentClassName().ok().map(bstr_to_string).unwrap_or_default() };
-        if !n.is_empty() || !t.is_empty() || !id.is_empty() || !class.is_empty() {
-            parts.push(format!("{t}:{n}#{id}[{class}]"));
-        }
-        cur = p;
-    }
-    parts.join(" < ")
-}
-
 /// Pure classifier — unit-tested without COM.
+#[allow(clippy::too_many_arguments)]
 pub fn classify_focus(
     control_type: i32,
     is_password: bool,
@@ -274,6 +429,10 @@ pub fn classify_focus(
     if is_password {
         return ControlKind::Password;
     }
+    // Navigation labels and ancestor text can mention a terminal without being its input.
+    if is_navigation_control(control_type, aria_role) {
+        return ControlKind::Other;
+    }
 
     let name_l = name.to_ascii_lowercase();
     let class_l = class_name.to_ascii_lowercase();
@@ -282,6 +441,18 @@ pub fn classify_focus(
     let role_l = aria_role.to_ascii_lowercase();
     let path_l = breadcrumb.to_ascii_lowercase();
 
+    // A filename or code text is not evidence of a chat/terminal control.
+    let monaco_code = contains_any(
+        &[&class_l, &path_l],
+        &["monaco-editor", "monaco-mouse-cursor-text"],
+    ) || (path_l.contains("overflow-guard") && path_l.contains("monaco"));
+    let structured_chat = contains_any(
+        &[&id_l, &class_l, &path_l],
+        &["ui-prompt-input", "composer", "chat-input", "prompt-input"],
+    );
+    if monaco_code && !structured_chat {
+        return ControlKind::CodeEditor;
+    }
     // Browser chrome: detect the omnibox/address bar before treating every Edit as a page input.
     // Keep the signals deliberately specific so ordinary web search boxes remain Edit → 中文.
     let address_bar = contains_any(
@@ -398,7 +569,7 @@ pub fn classify_focus(
 
     if control_type == UIA_EditControlTypeId.0 {
         if monaco_code && !chat_edit {
-            return ControlKind::Other;
+            return ControlKind::CodeEditor;
         }
         return ControlKind::Edit;
     }
@@ -425,9 +596,140 @@ fn contains_any(haystacks: &[&str], needles: &[&str]) -> bool {
         .any(|n| haystacks.iter().any(|h| h.contains(n)))
 }
 
+fn is_navigation_control(control_type: i32, aria_role: &str) -> bool {
+    use windows::Win32::UI::Accessibility::{
+        UIA_ButtonControlTypeId, UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId,
+        UIA_MenuItemControlTypeId, UIA_TabItemControlTypeId, UIA_TreeItemControlTypeId,
+    };
+    let role = aria_role.to_ascii_lowercase();
+    // Some terminal providers expose their editable helper with a Button UIA type.
+    if role
+        .split_whitespace()
+        .any(|r| matches!(r, "textbox" | "searchbox"))
+    {
+        return false;
+    }
+    role.split_whitespace().any(|r| {
+        matches!(
+            r,
+            "button" | "link" | "tab" | "menuitem" | "treeitem" | "listitem"
+        )
+    }) || [
+        UIA_ButtonControlTypeId,
+        UIA_HyperlinkControlTypeId,
+        UIA_ListItemControlTypeId,
+        UIA_MenuItemControlTypeId,
+        UIA_TabItemControlTypeId,
+        UIA_TreeItemControlTypeId,
+    ]
+    .iter()
+    .any(|kind| kind.0 == control_type)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_log_summary_excludes_input_and_ancestor_text() {
+        let info = FocusInfo {
+            name: "private message".into(),
+            automation_id: "private-id".into(),
+            breadcrumb: "group:private conversation#[composer]".into(),
+            ..Default::default()
+        };
+        let summary = info.log_summary();
+        assert!(!summary.contains("private"));
+        assert!(summary.contains("composer=true"));
+    }
+
+    #[test]
+    fn navigation_labels_and_ancestor_content_cannot_be_terminal_inputs() {
+        for name in ["终端", "Terminal", "Review project"] {
+            let info = FocusInfo {
+                control_type: 50000,
+                aria_role: "button".into(),
+                ..Default::default()
+            };
+            assert!(info.is_navigation_control());
+            assert_eq!(
+                classify_focus(
+                    50000,
+                    false,
+                    name,
+                    "",
+                    "",
+                    "button",
+                    "button",
+                    "组:#[contents] < 列表项目:聊天内容提到 terminal 和 xterm"
+                ),
+                ControlKind::Other
+            );
+        }
+        // A genuine input retains terminal classification, including unusual providers.
+        assert!(!is_navigation_control(50000, "textbox"));
+        assert_eq!(
+            classify_focus(
+                50004,
+                false,
+                "Terminal input",
+                "",
+                "",
+                "edit",
+                "textbox",
+                "组:#[xterm-helpers] < 组:#[xterm-screen]"
+            ),
+            ControlKind::Terminal
+        );
+    }
+
+    #[test]
+    fn code_names_do_not_override_monaco_structure() {
+        for name in [
+            "agent.rs",
+            "chat.rs",
+            "task.rs",
+            "terminal.rs",
+            "address bar.rs",
+        ] {
+            assert_eq!(
+                classify_focus(
+                    UIA_EditControlTypeId.0,
+                    false,
+                    name,
+                    "",
+                    "",
+                    "edit",
+                    "textbox",
+                    "group:#[monaco-editor] < group:#[overflow-guard]"
+                ),
+                ControlKind::CodeEditor
+            );
+            assert!(!FocusInfo {
+                name: name.into(),
+                breadcrumb: "group:#[monaco-editor]".into(),
+                ..Default::default()
+            }
+            .looks_explicit_chat_input());
+        }
+    }
+
+    #[test]
+    fn structured_composer_can_use_a_monaco_editor() {
+        assert_eq!(
+            classify_focus(
+                UIA_EditControlTypeId.0,
+                false,
+                "",
+                "",
+                "",
+                "edit",
+                "textbox",
+                "group:#[monaco-editor] < group:#[ui-prompt-input] < group:#[composer]"
+            ),
+            ControlKind::Edit
+        );
+    }
 
     #[test]
     fn terminal_wins_even_if_codex_nearby() {
@@ -475,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn monaco_code_edit_is_other_not_chat() {
+    fn monaco_code_edit_is_code_not_chat() {
         // 真实 Cursor Monaco 常是 type=50004 Edit，不是 Document。
         let k = classify_focus(
             UIA_EditControlTypeId.0,
@@ -487,7 +789,7 @@ mod tests {
             "textbox",
             "组:#[overflow-guard] < 代码:#[monaco-editor modified] < 组:#[editor-instance]",
         );
-        assert_eq!(k, ControlKind::Other);
+        assert_eq!(k, ControlKind::CodeEditor);
     }
 
     #[test]

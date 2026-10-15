@@ -43,6 +43,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "windows",

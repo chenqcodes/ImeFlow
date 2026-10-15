@@ -704,7 +704,7 @@ fn on_watch(
                 // logical terminal scope so an internal focus handoff cannot request Chinese.
                 effective_kind = uia::ControlKind::Terminal;
                 sticky_terminal = true;
-                tracing::info!(%exe, control = %focus.summarize(),
+                tracing::info!(%exe, control = %focus.log_summary(),
                     "cursor terminal handoff: transient Edit kept as terminal");
             } else {
                 last.lock().cursor_terminal_seen_at = None;
@@ -741,9 +741,9 @@ fn on_watch(
     let kind = Some(effective_kind);
     let target = engine.match_target(&exe, kind);
     let control_label = if sticky_terminal {
-        format!("{} [raw=edit, effective=terminal]", focus.summarize())
+        format!("{} [raw=edit, effective=terminal]", focus.log_summary())
     } else {
-        focus.summarize()
+        focus.log_summary()
     };
     // Display follows this logical region, not the last historical successful action.
     if bus.begin_focus(&key, &format!("{exe}/{}", effective_kind.as_str())) {

@@ -16,6 +16,9 @@ pub enum TargetMode {
 }
 
 impl TargetMode {
+    pub fn description(self) -> &'static str {
+        match self { Self::NativeChinese => "中文", Self::ImeEnglish => "英文（当前输入法）", Self::LayoutEnglish => "ENG 美式键盘", Self::Passthrough => "不干预" }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::NativeChinese => "中",
